@@ -19,10 +19,14 @@ import httpx
 from fastmcp import FastMCP
 from pydantic import Field
 
-from net_mcp import ripestat_get
+from net_mcp import cloudflare_get, ripestat_get
 from net_mcp.config import get_config
 from net_mcp.models import (
     ASNInfo,
+    BGPHijackEvent,
+    BGPHijackResult,
+    BGPLeakEvent,
+    BGPLeakResult,
     BGPRoute,
     BGPRouteLookupResult,
     CollectorPeerSummary,
@@ -70,12 +74,18 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         and peer information. Optionally filter by a specific RIPE RIS collector
         to get a regional perspective (e.g. RRC06 for Tokyo, RRC15 for Sao Paulo).
 
+        Queries RIPEstat and Cloudflare Radar as primary sources (both free).
         Use ris_collectors first to see which collectors are available and where
         they are located, then pass a collector ID here for targeted lookups.
         """
-        # 1. RIPEstat looking glass (free, no key, reliable)
+        # 1a. RIPEstat looking glass (free, no key, reliable)
         result = _ripestat_route_lookup(prefix, collector=collector)
         if result.routes:
+            return result
+
+        # 1b. Cloudflare Radar realtime routes (free with token)
+        result = _cloudflare_route_lookup(prefix)
+        if result is not None and result.routes:
             return result
 
         # 2. bgproutes.io (requires API key, includes RPKI ROV + ASPA)
@@ -225,40 +235,58 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         """Find which AS(es) originate a given prefix.
 
         Returns origin ASN(s) with AS name and RPKI validation status.
-        Use this to answer 'who announces this prefix?' questions.
+        Queries both RIPEstat and Cloudflare Radar (if configured) for
+        comprehensive results including RPKI status.
         """
-        try:
-            data = ripestat_get(
-                "routing-status/data.json",
-                params={"resource": prefix},
-            ).get("data", {})
+        origins = []
 
-            origins = []
-            for entry in data.get("origins", []):
-                origin_asn = entry.get("origin", 0)
-                if origin_asn:
-                    origins.append(
-                        PrefixOrigin(
-                            prefix=data.get("resource", prefix),
-                            origin_asn=origin_asn,
-                        )
+        # 1. Cloudflare Radar pfx2as (includes RPKI status per origin)
+        cf_data = cloudflare_get(
+            "radar/bgp/routes/pfx2as", params={"prefix": prefix}
+        )
+        if cf_data and cf_data.get("success"):
+            for entry in cf_data.get("result", {}).get("prefix_origins", []):
+                origins.append(
+                    PrefixOrigin(
+                        prefix=entry.get("prefix", prefix),
+                        origin_asn=entry.get("origin", 0),
+                        rpki_status=entry.get("rpki_validation"),
                     )
+                )
 
-            # Deduplicate by origin ASN
-            seen = set()
-            unique_origins = []
-            for o in origins:
-                if o.origin_asn not in seen:
-                    seen.add(o.origin_asn)
-                    unique_origins.append(o)
+        # 2. RIPEstat fallback/supplement
+        if not origins:
+            try:
+                data = ripestat_get(
+                    "routing-status/data.json",
+                    params={"resource": prefix},
+                ).get("data", {})
 
-            # Enrich with AS names
-            for origin in unique_origins:
-                origin.as_name = _get_as_name(origin.origin_asn)
+                for entry in data.get("origins", []):
+                    origin_asn = entry.get("origin", 0)
+                    if origin_asn:
+                        origins.append(
+                            PrefixOrigin(
+                                prefix=data.get("resource", prefix),
+                                origin_asn=origin_asn,
+                            )
+                        )
+            except Exception:
+                pass
 
-            return PrefixOriginResult(query_prefix=prefix, origins=unique_origins)
-        except Exception:
-            return PrefixOriginResult(query_prefix=prefix, origins=[])
+        # Deduplicate by origin ASN
+        seen = set()
+        unique_origins = []
+        for o in origins:
+            if o.origin_asn and o.origin_asn not in seen:
+                seen.add(o.origin_asn)
+                unique_origins.append(o)
+
+        # Enrich with AS names
+        for origin in unique_origins:
+            origin.as_name = _get_as_name(origin.origin_asn)
+
+        return PrefixOriginResult(query_prefix=prefix, origins=unique_origins)
 
     @mcp.tool(tags={"bgp", "routing"})
     def bgp_asn_info(
@@ -282,6 +310,67 @@ def register_bgp_tools(mcp: FastMCP) -> None:
             upstream_asns=upstreams,
             total_prefixes=len(prefixes_v4) + len(prefixes_v6),
         )
+
+    @mcp.tool(tags={"bgp", "security"})
+    def bgp_hijacks(
+        prefix: Annotated[
+            str | None,
+            Field(description="Filter by affected prefix (e.g. '1.1.1.0/24')"),
+        ] = None,
+        asn: Annotated[
+            int | None,
+            Field(description="Filter by involved ASN (hijacker or victim)"),
+        ] = None,
+        date_start: Annotated[
+            str | None,
+            Field(description="Start date in ISO 8601 (e.g. '2026-03-01T00:00:00')"),
+        ] = None,
+        date_end: Annotated[
+            str | None,
+            Field(description="End date in ISO 8601"),
+        ] = None,
+        min_confidence: Annotated[
+            int, Field(description="Minimum confidence score (0-100)")
+        ] = 50,
+        max_results: Annotated[int, Field(description="Max events to return")] = 20,
+    ) -> BGPHijackResult:
+        """Search for BGP origin hijack events.
+
+        Detects when an AS announces prefixes it is not authorized to
+        originate (based on RPKI, IRR, and historical data). Each event
+        includes a confidence score, the hijacker and victim ASNs,
+        affected prefixes, and duration.
+
+        Requires Cloudflare Radar API token (CLOUDFLARE_API_TOKEN).
+        """
+        return _cloudflare_hijacks(prefix, asn, date_start, date_end, min_confidence, max_results)
+
+    @mcp.tool(tags={"bgp", "security"})
+    def bgp_leaks(
+        asn: Annotated[
+            int | None,
+            Field(description="Filter by involved ASN (leaker or affected)"),
+        ] = None,
+        date_start: Annotated[
+            str | None,
+            Field(description="Start date in ISO 8601 (e.g. '2026-03-01T00:00:00')"),
+        ] = None,
+        date_end: Annotated[
+            str | None,
+            Field(description="End date in ISO 8601"),
+        ] = None,
+        max_results: Annotated[int, Field(description="Max events to return")] = 20,
+    ) -> BGPLeakResult:
+        """Search for BGP route leak events.
+
+        Detects when an AS improperly propagates routes it received from
+        one peer to another peer (violating expected routing policy).
+        Each event includes the leaking AS, affected origin/prefix counts,
+        and detection timestamps.
+
+        Requires Cloudflare Radar API token (CLOUDFLARE_API_TOKEN).
+        """
+        return _cloudflare_leaks(asn, date_start, date_end, max_results)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +560,164 @@ def _bgproutes_get_topology(api_key: str, asn: int) -> list[int] | None:
         return sorted(upstreams) if upstreams else None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare Radar backends (free with API token)
+# ---------------------------------------------------------------------------
+
+
+def _cloudflare_route_lookup(prefix: str) -> BGPRouteLookupResult | None:
+    """Look up real-time BGP routes via Cloudflare Radar."""
+    data = cloudflare_get("radar/bgp/routes/realtime", params={"prefix": prefix})
+    if not data or not data.get("success"):
+        return None
+
+    result = data.get("result", {})
+    raw_routes = result.get("routes", [])
+    if not raw_routes:
+        return None
+
+    routes = []
+    for r in raw_routes[:20]:
+        as_path = r.get("as_path", [])
+        origin_asn = as_path[-1] if as_path else 0
+        routes.append(
+            BGPRoute(
+                prefix=r.get("prefix", prefix),
+                origin_asn=origin_asn,
+                as_path=as_path,
+                communities=[str(c) for c in r.get("communities", [])],
+                peer_asn=0,
+                peer_ip="",
+                timestamp=r.get("timestamp", ""),
+                collector=r.get("collector", "cloudflare-radar"),
+            )
+        )
+
+    return BGPRouteLookupResult(
+        prefix=prefix,
+        routes=routes,
+        total=len(raw_routes),
+        source="Cloudflare Radar (real-time)",
+    )
+
+
+def _cloudflare_hijacks(
+    prefix: str | None,
+    asn: int | None,
+    date_start: str | None,
+    date_end: str | None,
+    min_confidence: int,
+    max_results: int,
+) -> BGPHijackResult:
+    """Query BGP hijack events from Cloudflare Radar."""
+    params: dict = {
+        "per_page": max_results,
+        "minConfidence": min_confidence,
+        "sortBy": "TIME",
+        "sortOrder": "DESC",
+    }
+    if prefix:
+        params["prefix"] = prefix
+    if asn:
+        params["involvedAsn"] = asn
+    if date_start:
+        params["dateStart"] = date_start
+    if date_end:
+        params["dateEnd"] = date_end
+
+    data = cloudflare_get("radar/bgp/hijacks/events", params=params)
+    if not data or not data.get("success"):
+        if not get_config().cloudflare_api_token:
+            return BGPHijackResult(
+                events=[], total=0,
+                source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
+            )
+        return BGPHijackResult(
+            events=[], total=0, source="Cloudflare Radar API error",
+        )
+
+    result = data.get("result", {})
+    events = []
+    for e in result.get("events", []):
+        events.append(
+            BGPHijackEvent(
+                id=e.get("id", 0),
+                confidence_score=e.get("confidence_score", 0),
+                hijacker_asn=e.get("hijacker_asn", 0),
+                victim_asns=e.get("victim_asns", []),
+                prefixes=e.get("prefixes", []),
+                hijacker_country=e.get("hijacker_country"),
+                victim_countries=e.get("victim_countries", []),
+                duration=e.get("duration", 0),
+                is_ongoing=e.get("on_going_count", 0) > 0,
+                detected_at=e.get("min_hijack_ts", ""),
+                last_seen=e.get("max_hijack_ts", ""),
+                peer_count=e.get("peer_ip_count", 0),
+                tags=[t.get("name", "") for t in e.get("tags", [])],
+            )
+        )
+
+    total = data.get("result_info", {}).get("total_count", len(events))
+    return BGPHijackResult(
+        events=events, total=total, source="Cloudflare Radar",
+    )
+
+
+def _cloudflare_leaks(
+    asn: int | None,
+    date_start: str | None,
+    date_end: str | None,
+    max_results: int,
+) -> BGPLeakResult:
+    """Query BGP route leak events from Cloudflare Radar."""
+    params: dict = {
+        "per_page": max_results,
+        "sortBy": "TIME",
+        "sortOrder": "DESC",
+    }
+    if asn:
+        params["involvedAsn"] = asn
+    if date_start:
+        params["dateStart"] = date_start
+    if date_end:
+        params["dateEnd"] = date_end
+
+    data = cloudflare_get("radar/bgp/leaks/events", params=params)
+    if not data or not data.get("success"):
+        if not get_config().cloudflare_api_token:
+            return BGPLeakResult(
+                events=[], total=0,
+                source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
+            )
+        return BGPLeakResult(
+            events=[], total=0, source="Cloudflare Radar API error",
+        )
+
+    result = data.get("result", {})
+    events = []
+    for e in result.get("events", []):
+        events.append(
+            BGPLeakEvent(
+                id=e.get("id", 0),
+                leak_asn=e.get("leak_asn", 0),
+                leak_segment=e.get("leak_seg", []),
+                leak_type=e.get("leak_type", 0),
+                origin_count=e.get("origin_count", 0),
+                prefix_count=e.get("prefix_count", 0),
+                peer_count=e.get("peer_count", 0),
+                countries=e.get("countries", []),
+                detected_at=e.get("min_ts", ""),
+                last_seen=e.get("max_ts", ""),
+                finished=e.get("finished", False),
+            )
+        )
+
+    total = data.get("result_info", {}).get("total_count", len(events))
+    return BGPLeakResult(
+        events=events, total=total, source="Cloudflare Radar",
+    )
 
 
 # ---------------------------------------------------------------------------

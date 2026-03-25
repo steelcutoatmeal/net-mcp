@@ -36,6 +36,15 @@ Gives LLMs structured access to real network state using public data sources (RI
 | `mrt_search` | Find available MRT archive files (RIB dumps or updates) for a time range and collector |
 | `bgp_historical_lookup` | Download and parse MRT files to retrieve BGP routes for a prefix at a specific point in time |
 
+### BGP — Security (Cloudflare Radar)
+
+| Tool | Description |
+|------|-------------|
+| `bgp_hijacks` | Search BGP origin hijack events with confidence scores, affected prefixes, hijacker/victim ASNs |
+| `bgp_leaks` | Search BGP route leak events — improper route propagation between peers |
+
+These tools require a Cloudflare Radar API token (`CLOUDFLARE_API_TOKEN`). Free to obtain at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens).
+
 ### Local Diagnostics
 
 Tools that run standard CLI commands on the user's machine. All inputs are validated and passed as list arguments to subprocess (never `shell=True`) to prevent command injection.
@@ -64,7 +73,8 @@ Data sources are queried in this priority order:
 
 | Source | Auth | Used For |
 |--------|------|----------|
-| **RIPEstat** | None (free) | BGP looking glass, routing status, prefix origins, AS info, RPKI validation, collector metadata |
+| **RIPEstat** | None (free) | BGP looking glass, routing status, prefix origins, AS info, RPKI validation, collector metadata. Primary for most queries |
+| **Cloudflare Radar** | Free API token | Real-time BGP routes, prefix-to-ASN with RPKI status, BGP hijack detection, BGP route leak detection. Primary alongside RIPEstat |
 | **bgproutes.io** | API key required | RIB snapshots with RPKI ROV + ASPA validation, BGP updates, AS topology. Only used when API key is configured |
 | **bgp.tools** | None (free) | ASN-to-name mappings (asns.csv, cached in-memory), full BGP table (table.jsonl, last resort) |
 | **RIPE RIS MRT archive** | None (free) | Historical RIB dumps and BGP update files, accessed via BGPKIT Broker + Parser |
@@ -142,6 +152,7 @@ resolver = "1.1.1.1"
 | `NET_MCP_MRT_MAX_CACHE_GB` | Max cache size before evicting old files | `10` |
 | `NET_MCP_DEFAULT_COLLECTOR` | Default RIPE RIS collector ID | `rrc00` |
 | `NET_MCP_DNS_RESOLVER` | Default DNS resolver IP | `1.1.1.1` |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare Radar API token ([get one free](https://dash.cloudflare.com/profile/api-tokens)) | (none) |
 | `BGPROUTES_API_KEY` | bgproutes.io API key | (none) |
 
 ## MRT File Caching

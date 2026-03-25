@@ -191,3 +191,48 @@ class ASNInfo(BaseModel):
     prefixes_v6: list[str]
     upstream_asns: list[int]
     total_prefixes: int
+
+
+# --- BGP Hijack / Leak Models ---
+
+
+class BGPHijackEvent(BaseModel):
+    id: int
+    confidence_score: float
+    hijacker_asn: int
+    victim_asns: list[int]
+    prefixes: list[str]
+    hijacker_country: str | None = None
+    victim_countries: list[str] = []
+    duration: int = Field(description="Duration in seconds")
+    is_ongoing: bool = False
+    detected_at: str = ""
+    last_seen: str = ""
+    peer_count: int = 0
+    tags: list[str] = []
+
+
+class BGPHijackResult(BaseModel):
+    events: list[BGPHijackEvent]
+    total: int
+    source: str
+
+
+class BGPLeakEvent(BaseModel):
+    id: int
+    leak_asn: int
+    leak_segment: list[int] = []
+    leak_type: int
+    origin_count: int
+    prefix_count: int
+    peer_count: int
+    countries: list[str] = []
+    detected_at: str = ""
+    last_seen: str = ""
+    finished: bool = False
+
+
+class BGPLeakResult(BaseModel):
+    events: list[BGPLeakEvent]
+    total: int
+    source: str

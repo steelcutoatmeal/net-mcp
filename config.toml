@@ -10,6 +10,11 @@
 mrt_max_cache_gb = 10
 
 [api]
+# Cloudflare Radar API token (free — or set CLOUDFLARE_API_TOKEN env var)
+# Get one at: https://dash.cloudflare.com/profile/api-tokens
+# Required for: bgp_hijacks, bgp_leaks, Cloudflare route lookups, RPKI status in prefix origins
+# cloudflare_api_token = "your-token-here"
+
 # bgproutes.io API key (or set BGPROUTES_API_KEY env var)
 # bgproutes_api_key = "your-key-here"
 

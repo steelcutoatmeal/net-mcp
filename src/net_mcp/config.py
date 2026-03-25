@@ -47,6 +47,12 @@ class NetMCPConfig:
             or None
         )
 
+        self.cloudflare_api_token: str | None = (
+            os.environ.get("CLOUDFLARE_API_TOKEN")
+            or api.get("cloudflare_api_token")
+            or None
+        )
+
         self.default_collector: str = (
             os.environ.get("NET_MCP_DEFAULT_COLLECTOR")
             or raw.get("bgp", {}).get("default_collector", "rrc00")

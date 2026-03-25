@@ -45,6 +45,33 @@ Gives LLMs structured access to real network state using public data sources (RI
 
 These tools require a Cloudflare Radar API token (`CLOUDFLARE_API_TOKEN`). Free to obtain at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens).
 
+### IRR (Internet Routing Registry)
+
+| Tool | Description |
+|------|-------------|
+| `irr_route_lookup` | Look up route objects by prefix or origin ASN across RADB, RIPE, ARIN, and other registries |
+| `irr_autnum` | Look up aut-num objects — AS name, description, import/export policies |
+| `irr_as_set_expand` | Expand an AS-SET into its member ASNs (e.g. AS-CLOUDFLARE → list of ASNs) |
+
+### PeeringDB
+
+| Tool | Description |
+|------|-------------|
+| `peeringdb_network` | Look up a network by ASN — peering policy, IXP presence, port speeds, IRR as-set |
+| `peeringdb_ix` | Search IXPs by name or city — location, member list, route server info |
+| `peeringdb_facility` | Search data center facilities — location, network count |
+
+### IP/Subnet Math & Bogon Detection
+
+| Tool | Description |
+|------|-------------|
+| `subnet_info` | Get full details on a prefix — network/broadcast, host count, private/global classification |
+| `subnet_split` | Split a prefix into smaller subnets (e.g. /24 → four /26s) |
+| `ip_contains` | Check if an IP or prefix is within a network (e.g. is 10.5.5.1 in 10.0.0.0/8?) |
+| `prefix_overlap` | Check if two prefixes overlap and the relationship (contains, equal, disjoint) |
+| `supernet_aggregate` | Aggregate contiguous prefixes into the smallest covering supernet |
+| `bogon_check` | Check if an IP/prefix is reserved space (RFC 1918, CGNAT, documentation, multicast, etc.) |
+
 ### Local Diagnostics
 
 Tools that run standard CLI commands on the user's machine. All inputs are validated and passed as list arguments to subprocess (never `shell=True`) to prevent command injection.
@@ -78,6 +105,8 @@ Data sources are queried in this priority order:
 | **bgproutes.io** | API key required | RIB snapshots with RPKI ROV + ASPA validation, BGP updates, AS topology. Only used when API key is configured |
 | **bgp.tools** | None (free) | ASN-to-name mappings (asns.csv, cached in-memory), full BGP table (table.jsonl, last resort) |
 | **RIPE RIS MRT archive** | None (free) | Historical RIB dumps and BGP update files, accessed via BGPKIT Broker + Parser |
+| **IRR databases** | None (free) | Route objects, aut-num, AS-SET expansion via whois protocol (RADB, RIPE, ARIN, APNIC, etc.) |
+| **PeeringDB** | None (free) | Network peering info, IXP membership, facility data. No API key needed for read-only |
 | **dnspython** | N/A (local) | All DNS queries and DNSSEC validation |
 
 All RIPEstat requests include `sourceapp=net-mcp` per their API guidelines.
@@ -179,6 +208,12 @@ Once connected as an MCP server, an LLM can answer questions like:
 - "Trace the path to 8.8.8.8" → `local_traceroute`
 - "What ports are open on 192.168.1.1?" → `local_nmap`
 - "Show my routing table" → `local_routes`
+- "What route objects does AS13335 have in IRR?" → `irr_route_lookup`
+- "Where does Cloudflare peer?" → `peeringdb_network(13335)`
+- "What ASes are at AMS-IX?" → `peeringdb_ix("AMS-IX", include_members=True)`
+- "Split 10.0.0.0/24 into /26s" → `subnet_split`
+- "Is 192.168.1.1 a bogon?" → `bogon_check`
+- "Do these two prefixes overlap?" → `prefix_overlap`
 
 ## Development
 

@@ -13,12 +13,14 @@ Gives LLMs structured access to real network state using public data sources (RI
 | `dns_lookup` | Query DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME, PTR, SRV, CAA) with DNSSEC validation status |
 | `dns_trace` | Trace delegation chain from root to authoritative, showing DNSSEC signing status at each zone level |
 
-### RPKI
+### RPKI & ASPA
 
 | Tool | Description |
 |------|-------------|
-| `rpki_validate` | Validate a prefix + origin ASN pair against RPKI ROAs. Returns VALID, INVALID, or NOT_FOUND with matching ROAs |
+| `rpki_validate` | Validate a prefix + origin ASN pair against RPKI ROAs. Queries RIPEstat (ROA details) and Cloudflare Radar (status cross-check) |
 | `rpki_roa_lookup` | Look up all ROAs for a given prefix or ASN, including max-length and trust anchor |
+| `rpki_aspa_lookup` | Look up ASPA objects — which upstream providers an AS has authorized (Cloudflare Radar) |
+| `rpki_aspa_changes` | Track ASPA object changes over time — additions, removals, modifications (Cloudflare Radar) |
 
 ### BGP — Live
 

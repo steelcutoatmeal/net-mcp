@@ -74,6 +74,38 @@ class ROALookupResult(BaseModel):
     total: int
 
 
+# --- ASPA Models ---
+
+
+class ASPAObject(BaseModel):
+    customer_asn: int = Field(description="The customer AS that created this ASPA")
+    providers: list[int] = Field(description="Authorized upstream provider ASNs")
+    customer_name: str | None = None
+    customer_country: str | None = None
+
+
+class ASPASnapshotResult(BaseModel):
+    objects: list[ASPAObject]
+    total: int
+    data_time: str = ""
+    source: str
+
+
+class ASPAChange(BaseModel):
+    date: str
+    customer_asn: int
+    providers: list[int]
+    change_type: str = Field(description="'added', 'removed', or 'modified'")
+
+
+class ASPAChangesResult(BaseModel):
+    changes: list[ASPAChange]
+    total: int
+    date_start: str = ""
+    date_end: str = ""
+    source: str
+
+
 # --- Route Collector Models ---
 
 

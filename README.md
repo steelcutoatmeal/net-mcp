@@ -36,6 +36,28 @@ Gives LLMs structured access to real network state using public data sources (RI
 | `mrt_search` | Find available MRT archive files (RIB dumps or updates) for a time range and collector |
 | `bgp_historical_lookup` | Download and parse MRT files to retrieve BGP routes for a prefix at a specific point in time |
 
+### Local Diagnostics
+
+Tools that run standard CLI commands on the user's machine. All inputs are validated and passed as list arguments to subprocess (never `shell=True`) to prevent command injection.
+
+| Tool | Description | Admin Required |
+|------|-------------|:-:|
+| `local_ping` | Ping a host with configurable count and timeout | No |
+| `local_traceroute` | Trace network path to a host (UDP mode) | No |
+| `local_mtr` | Combined ping + traceroute with per-hop stats | Yes (raw sockets) |
+| `local_dig` | DNS lookup via dig (falls back to nslookup) | No |
+| `local_interfaces` | Show network interfaces and IP addresses | No |
+| `local_routes` | Show the local routing table | No |
+| `local_connections` | Show active TCP/UDP connections and listening ports | No (PIDs need admin) |
+| `local_arp` | Show ARP table (IP-to-MAC mappings) | No |
+| `local_whois` | Whois lookup for domains, IPs, or ASNs | No |
+| `local_curl` | Make HTTP requests, check headers and connectivity | No |
+| `local_nmap` | TCP connect scan (port scanning, no SYN scan) | No |
+| `local_netstat_stats` | Show TCP/UDP/ICMP protocol statistics | No |
+| `local_public_ip` | Get the public-facing IP of the machine | No |
+
+Tools that require admin privileges will attempt to run and return a clear error message if permission is denied. Cross-platform: macOS, Linux, and Windows.
+
 ## Data Sources
 
 Data sources are queried in this priority order:
@@ -141,6 +163,11 @@ Once connected as an MCP server, an LLM can answer questions like:
 - "Is cloudflare.com DNSSEC signed?" → `dns_lookup` or `dns_trace`
 - "Show me routes to 1.1.1.0/24 from Tokyo" → `ris_collectors(region='asia')` then `bgp_route_lookup(prefix, collector='RRC06')`
 - "What did routing look like for 8.8.8.0/24 two days ago?" → `mrt_search` then `bgp_historical_lookup`
+- "Ping 1.1.1.1 from my machine" → `local_ping`
+- "What's my public IP?" → `local_public_ip`
+- "Trace the path to 8.8.8.8" → `local_traceroute`
+- "What ports are open on 192.168.1.1?" → `local_nmap`
+- "Show my routing table" → `local_routes`
 
 ## Development
 

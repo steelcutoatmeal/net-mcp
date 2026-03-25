@@ -4,6 +4,28 @@ MCP server for network engineering — BGP routing analysis, RPKI validation, DN
 
 Gives LLMs structured access to real network state using public data sources (RIPE RIS, RIPEstat, RPKI repositories, bgp.tools, bgproutes.io).
 
+## Example Queries
+
+Once connected as an MCP server, an LLM can answer questions like:
+
+- "Is 1.1.1.0/24 RPKI valid?" → `rpki_validate`
+- "Who originates 8.8.8.0/24?" → `bgp_prefix_origin`
+- "What does Cloudflare's AS footprint look like?" → `bgp_asn_info(13335)`
+- "Is cloudflare.com DNSSEC signed?" → `dns_lookup` or `dns_trace`
+- "Show me routes to 1.1.1.0/24 from Tokyo" → `ris_collectors(region='asia')` then `bgp_route_lookup(prefix, collector='RRC06')`
+- "What did routing look like for 8.8.8.0/24 two days ago?" → `mrt_search` then `bgp_historical_lookup`
+- "What route objects does AS13335 have in IRR?" → `irr_route_lookup`
+- "Where does Cloudflare peer?" → `peeringdb_network(13335)`
+- "What ASes are at AMS-IX?" → `peeringdb_ix("AMS-IX", include_members=True)`
+- "Split 10.0.0.0/24 into /26s" → `subnet_split`
+- "Is 192.168.1.1 a bogon?" → `bogon_check`
+- "Do these two prefixes overlap?" → `prefix_overlap`
+- "Ping 1.1.1.1 from my machine" → `local_ping`
+- "What's my public IP?" → `local_public_ip`
+- "Trace the path to 8.8.8.8" → `local_traceroute`
+- "What ports are open on 192.168.1.1?" → `local_nmap`
+- "Show my routing table" → `local_routes`
+
 ## Tools
 
 ### DNS
@@ -194,28 +216,6 @@ Historical BGP lookups download MRT files from the RIPE RIS archive. These files
 - **Update files** (`updates`): ~3MB each, created every 5 minutes
 
 Downloaded files are cached at `<mrt_cache_dir>/<collector>/<year.month>/<filename>.gz` and reused on subsequent queries. The cache is automatically pruned when it exceeds `mrt_max_cache_gb`.
-
-## Example Queries
-
-Once connected as an MCP server, an LLM can answer questions like:
-
-- "Is 1.1.1.0/24 RPKI valid?" → `rpki_validate`
-- "Who originates 8.8.8.0/24?" → `bgp_prefix_origin`
-- "What does Cloudflare's AS footprint look like?" → `bgp_asn_info(13335)`
-- "Is cloudflare.com DNSSEC signed?" → `dns_lookup` or `dns_trace`
-- "Show me routes to 1.1.1.0/24 from Tokyo" → `ris_collectors(region='asia')` then `bgp_route_lookup(prefix, collector='RRC06')`
-- "What did routing look like for 8.8.8.0/24 two days ago?" → `mrt_search` then `bgp_historical_lookup`
-- "Ping 1.1.1.1 from my machine" → `local_ping`
-- "What's my public IP?" → `local_public_ip`
-- "Trace the path to 8.8.8.8" → `local_traceroute`
-- "What ports are open on 192.168.1.1?" → `local_nmap`
-- "Show my routing table" → `local_routes`
-- "What route objects does AS13335 have in IRR?" → `irr_route_lookup`
-- "Where does Cloudflare peer?" → `peeringdb_network(13335)`
-- "What ASes are at AMS-IX?" → `peeringdb_ix("AMS-IX", include_members=True)`
-- "Split 10.0.0.0/24 into /26s" → `subnet_split`
-- "Is 192.168.1.1 a bogon?" → `bogon_check`
-- "Do these two prefixes overlap?" → `prefix_overlap`
 
 ## Development
 

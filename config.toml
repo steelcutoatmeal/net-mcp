@@ -1,0 +1,22 @@
+# net-mcp configuration
+# All settings can also be set via environment variables with NET_MCP_ prefix.
+
+[storage]
+# Directory for downloaded MRT files (RIB dumps can be ~400MB each).
+# Default: system temp directory (/tmp/net-mcp/mrt)
+# mrt_cache_dir = "/path/to/mrt/cache"
+
+# Maximum cache size in GB. Oldest files are removed when exceeded.
+mrt_max_cache_gb = 10
+
+[api]
+# bgproutes.io API key (or set BGPROUTES_API_KEY env var)
+# bgproutes_api_key = "your-key-here"
+
+[bgp]
+# Default RIPE RIS collector for queries (e.g. rrc00, rrc06)
+default_collector = "rrc00"
+
+[dns]
+# Default DNS resolver
+resolver = "1.1.1.1"

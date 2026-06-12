@@ -29,6 +29,11 @@ IRR_SERVERS = {
 DEFAULT_SERVERS = ["radb", "ripe"]
 WHOIS_TIMEOUT = 15
 
+# AS-SET recursion bounds
+_MAX_SET_DEPTH = 6
+_MAX_SET_MEMBERS = 20000
+_ASN_RE = re.compile(r"^AS\d+$", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -175,32 +180,20 @@ def register_irr_tools(mcp: FastMCP) -> None:
     ) -> IRRAsSetResult:
         """Expand an AS-SET into its member ASNs.
 
-        Recursively resolves an AS-SET to find all member autonomous systems.
-        Useful for understanding the customer cone of a transit provider or
-        what ASNs are in a peering group. Uses RADB by default as it
-        aggregates from multiple registries.
+        Recursively resolves an AS-SET: reads its `members`/`mp-members`
+        attributes, follows any nested AS-SET members, and collects every
+        member ASN. Useful for understanding the customer cone of a transit
+        provider or what ASNs are in a peering group. Uses RADB by default
+        because it mirrors objects from many registries.
+
+        Recursion is bounded (6 levels deep, 20000 ASNs) to keep very large
+        transit cones from running unbounded.
         """
         server = IRR_SERVERS.get(source.lower(), IRR_SERVERS["radb"])
-        raw = _whois_query(server, f"-i member-of {as_set}", source)
 
-        members = set()
-        for line in raw.split("\n"):
-            line = line.strip()
-            # Look for aut-num objects returned by member-of query
-            if line.lower().startswith("aut-num:"):
-                val = line.split(":", 1)[1].strip()
-                members.add(val.upper())
-
-        # Also try direct set members
-        raw2 = _whois_query(server, as_set, source)
-        for line in raw2.split("\n"):
-            line = line.strip()
-            if line.lower().startswith("members:"):
-                vals = line.split(":", 1)[1].strip()
-                for m in vals.split(","):
-                    m = m.strip()
-                    if m:
-                        members.add(m.upper())
+        members: set[str] = set()
+        visited: set[str] = set()
+        _expand_as_set(server, as_set.upper(), source, visited, members)
 
         return IRRAsSetResult(
             as_set=as_set,
@@ -216,13 +209,14 @@ def register_irr_tools(mcp: FastMCP) -> None:
 
 
 def _whois_query(server: str, query: str, source: str) -> str:
-    """Send a whois query and return raw response text."""
+    """Send a whois query and return raw response text.
+
+    No source restriction is applied: RADB mirrors many registries, and
+    restricting to `-s RADB` would exclude those mirrored objects, defeating
+    the point of querying an aggregating server.
+    """
     try:
-        # Add source flag for RADB (which aggregates multiple sources)
-        if source.lower() == "radb":
-            query_str = f"-s RADB {query}\r\n"
-        else:
-            query_str = f"{query}\r\n"
+        query_str = f"{query}\r\n"
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(WHOIS_TIMEOUT)
@@ -252,6 +246,95 @@ def _parse_sources(sources: str | None) -> list[str]:
     if not sources:
         return list(DEFAULT_SERVERS)
     return [s.strip().lower() for s in sources.split(",") if s.strip()]
+
+
+def _rpsl_attrs(raw: str):
+    """Yield (key, value) pairs from an RPSL object, merging continuation lines.
+
+    RPSL continuation: a physical line beginning with a space, tab, or '+' is
+    a continuation of the previous attribute's value. Without this, multi-line
+    attributes (common for large `members:` lists) are silently truncated.
+    """
+    key: str | None = None
+    parts: list[str] = []
+
+    def flush():
+        nonlocal key, parts
+        if key is not None:
+            yield_val = (key, " ".join(p for p in parts if p))
+            parts = []
+            key = None
+            return yield_val
+        return None
+
+    for line in raw.split("\n"):
+        if not line.strip() or line.startswith("%"):
+            out = flush()
+            if out:
+                yield out
+            continue
+        if line[0] in " \t+":
+            cont = line.strip().lstrip("+").strip()
+            if cont:
+                parts.append(cont)
+            continue
+        if ":" in line:
+            out = flush()
+            if out:
+                yield out
+            k, _, v = line.partition(":")
+            key = k.strip().lower()
+            parts = [v.strip()]
+
+    out = flush()
+    if out:
+        yield out
+
+
+def _rpsl_set_members(raw: str) -> list[str]:
+    """Extract member tokens from an AS-SET's members/mp-members attributes."""
+    out: list[str] = []
+    for key, value in _rpsl_attrs(raw):
+        if key in ("members", "mp-members"):
+            for tok in re.split(r"[\s,]+", value):
+                tok = tok.strip()
+                if tok:
+                    out.append(tok)
+    return out
+
+
+def _looks_like_set(token: str) -> bool:
+    """True if a member token names an AS-SET/route-set rather than an ASN."""
+    t = token.upper()
+    return ("AS-" in t) or ("RS-" in t) or (":" in t)
+
+
+def _expand_as_set(
+    server: str,
+    name: str,
+    source: str,
+    visited: set[str],
+    members: set[str],
+    depth: int = 0,
+) -> None:
+    """Recursively expand an AS-SET, collecting member ASNs into `members`."""
+    if depth > _MAX_SET_DEPTH or len(members) >= _MAX_SET_MEMBERS:
+        return
+
+    name = name.upper()
+    if name in visited:
+        return
+    visited.add(name)
+
+    raw = _whois_query(server, name, source)
+    for token in _rpsl_set_members(raw):
+        t = token.upper()
+        if _ASN_RE.match(t):
+            members.add(t)
+        elif _looks_like_set(t):
+            _expand_as_set(server, t, source, visited, members, depth + 1)
+        if len(members) >= _MAX_SET_MEMBERS:
+            return
 
 
 def _parse_route_objects(raw: str, source: str) -> list[IRRRouteObject]:

@@ -292,12 +292,26 @@ def _validate_ripestat(prefix: str, origin_asn: int) -> RPKIValidationResult | N
             timeout=HTTP_TIMEOUT,
         ).get("data", {})
 
-        status = data.get("status", "unknown").upper()
-        if status not in ("VALID", "INVALID", "NOT_FOUND"):
-            status = {"UNKNOWN": "NOT_FOUND"}.get(status, status)
+        # RIPEstat returns granular statuses: "valid", "invalid_asn",
+        # "invalid_length", "unknown". Normalize to the three documented
+        # values while preserving the reason for the detail string.
+        raw_status = str(data.get("status", "unknown")).lower()
+        reason = None
+        if raw_status == "valid":
+            status = "VALID"
+        elif raw_status.startswith("invalid"):
+            status = "INVALID"
+            if "asn" in raw_status:
+                reason = "origin ASN not authorized by any covering ROA"
+            elif "length" in raw_status:
+                reason = "prefix length exceeds the ROA max-length"
+        elif raw_status in ("unknown", "not_found", ""):
+            status = "NOT_FOUND"
+        else:
+            status = raw_status.upper()
 
         roas = _parse_roas(data.get("validating_roas", []))
-        detail = _build_detail(status, len(roas), prefix, origin_asn)
+        detail = _build_detail(status, len(roas), prefix, origin_asn, reason)
 
         return RPKIValidationResult(
             prefix=prefix,
@@ -353,11 +367,16 @@ def _parse_roas(vrps: list[dict]) -> list[ROA]:
     return roas
 
 
-def _build_detail(status: str, roa_count: int, prefix: str, origin_asn: int) -> str:
+def _build_detail(
+    status: str, roa_count: int, prefix: str, origin_asn: int, reason: str | None = None
+) -> str:
     """Build a human-readable detail string for RPKI validation."""
     if status == "VALID":
         return f"Route {prefix} from AS{origin_asn} is RPKI VALID — {roa_count} matching ROA(s)."
     elif status == "INVALID":
-        return f"Route {prefix} from AS{origin_asn} is RPKI INVALID — ASN or prefix length mismatch."
-    else:
+        why = reason or "origin ASN or prefix length does not match a covering ROA"
+        return f"Route {prefix} from AS{origin_asn} is RPKI INVALID — {why}."
+    elif status == "NOT_FOUND":
         return f"No ROAs found covering {prefix} — RPKI status is NOT_FOUND."
+    else:
+        return f"Route {prefix} from AS{origin_asn} RPKI status: {status}."

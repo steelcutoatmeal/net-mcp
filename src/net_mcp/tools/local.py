@@ -23,6 +23,8 @@ from typing import Annotated
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from net_mcp.config import get_config
+
 
 # ---------------------------------------------------------------------------
 # Input validation
@@ -39,6 +41,14 @@ def _validate_host(value: str) -> str:
     value = value.strip()
     if not value or len(value) > 253:
         raise ValueError(f"Invalid host: {value!r}")
+    # Reject leading '-' (and '/'): args are passed positionally, but a value
+    # like '-oN/tmp/x' or '--script=...' would otherwise be parsed as a flag
+    # by ping/traceroute/nmap/etc. A real hostname never starts with these.
+    if value[0] in "-/":
+        raise ValueError(
+            f"Invalid host: {value!r} — must not begin with '-' or '/' "
+            "(could be interpreted as a command-line flag)."
+        )
     if not _SAFE_HOST_RE.match(value):
         raise ValueError(
             f"Invalid characters in host: {value!r}. "
@@ -107,6 +117,24 @@ class CommandResult(BaseModel):
     success: bool
     platform: str
     note: str = Field(default="", description="Additional context about the result")
+
+
+def _disabled_result(tool: str) -> CommandResult:
+    """Result returned when an active local tool is disabled by config."""
+    return CommandResult(
+        command=tool,
+        returncode=126,
+        stdout="",
+        stderr=(
+            f"{tool} is disabled. It can scan or fetch arbitrary network "
+            "targets from this host, so it is off by default. To enable it, "
+            "set allow_active_tools = true under [local] in config.toml, or "
+            "set the NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS=1 environment variable."
+        ),
+        success=False,
+        platform=platform.system(),
+        note="Active local tool disabled by configuration.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +484,13 @@ def register_local_tools(mcp: FastMCP) -> None:
         Useful for testing connectivity, checking HTTP headers, TLS
         certificates, and response codes from the local network perspective.
         Does not require admin privileges.
+
+        Disabled by default (it can reach internal/metadata endpoints from
+        this host). Enable via allow_active_tools in config.
         """
+        if not get_config().allow_active_local_tools:
+            return _disabled_result("curl")
+
         # Validate URL has a scheme
         url = url.strip()
         if not url.startswith(("http://", "https://")):
@@ -509,7 +543,13 @@ def register_local_tools(mcp: FastMCP) -> None:
         Uses TCP connect scan (-sT) which does NOT require admin privileges.
         SYN scans and OS detection require root and are not used here.
         Nmap must be installed separately.
+
+        Disabled by default (it can scan arbitrary internal hosts from this
+        machine). Enable via allow_active_tools in config.
         """
+        if not get_config().allow_active_local_tools:
+            return _disabled_result("nmap")
+
         target = _validate_host(target)
 
         nmap = _find_cmd("nmap")

@@ -11,7 +11,8 @@ Data sources (in priority order):
 
 from __future__ import annotations
 
-import os
+import json
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -79,9 +80,9 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         they are located, then pass a collector ID here for targeted lookups.
         """
         # 1a. RIPEstat looking glass (free, no key, reliable)
-        result = _ripestat_route_lookup(prefix, collector=collector)
-        if result.routes:
-            return result
+        ripestat_result = _ripestat_route_lookup(prefix, collector=collector)
+        if ripestat_result.routes:
+            return ripestat_result
 
         # 1b. Cloudflare Radar realtime routes (free with token)
         result = _cloudflare_route_lookup(prefix)
@@ -95,8 +96,13 @@ def register_bgp_tools(mcp: FastMCP) -> None:
             if result is not None:
                 return result
 
-        # 3. bgp.tools table (full table download, last resort)
-        return _bgptools_route_lookup(prefix)
+        # 3. bgp.tools table — downloads the full BGP table, so only use it as
+        #    a true last resort when the primary source actually failed. If
+        #    RIPEstat answered successfully but the prefix simply isn't routed,
+        #    return that empty result rather than pulling the whole table.
+        if ripestat_result.source.startswith("RIPEstat error"):
+            return _bgptools_route_lookup(prefix)
+        return ripestat_result
 
     @mcp.tool(tags={"bgp", "routing", "collectors"})
     def ris_collectors(
@@ -378,36 +384,75 @@ def register_bgp_tools(mcp: FastMCP) -> None:
 # ---------------------------------------------------------------------------
 
 
+# bgp.tools asks that table.jsonl not be fetched more than every 30 minutes.
+_BGPTOOLS_TABLE_TTL = 1800
+
+
+def _bgptools_table_path() -> Path:
+    """Local cache path for the bgp.tools full BGP table."""
+    base = get_config().mrt_cache_dir
+    base.parent.mkdir(parents=True, exist_ok=True)
+    return base.parent / "bgptools-table.jsonl"
+
+
+def _download_bgptools_table(path: Path) -> None:
+    """Download bgp.tools/table.jsonl to a local cache file (atomic replace)."""
+    tmp = path.with_suffix(".tmp")
+    try:
+        with httpx.Client(timeout=120, headers=BGP_TOOLS_HEADERS) as client:
+            with client.stream("GET", f"{BGP_TOOLS_BASE}/table.jsonl") as resp:
+                resp.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                        f.write(chunk)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _bgptools_route_lookup(prefix: str) -> BGPRouteLookupResult:
     """Look up a prefix via bgp.tools table.jsonl (full table, filter locally).
 
-    Note: Downloads the full BGP table (~15MB compressed). This is a last-resort
-    fallback. bgp.tools asks that this not be fetched more than every 30 minutes.
+    Downloads the full BGP table (~15MB compressed) and caches it on disk.
+    The cached copy is reused for 30 minutes (bgp.tools' requested minimum
+    refetch interval), so repeated fallbacks don't re-download. This is a
+    last-resort source used only when the primary lookups fail.
     """
     try:
-        with httpx.Client(timeout=60, headers=BGP_TOOLS_HEADERS) as client:
-            routes = []
-            with client.stream("GET", f"{BGP_TOOLS_BASE}/table.jsonl") as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    import json
+        path = _bgptools_table_path()
+        fresh = (
+            path.exists()
+            and (time.time() - path.stat().st_mtime) < _BGPTOOLS_TABLE_TTL
+        )
+        if not fresh:
+            try:
+                _download_bgptools_table(path)
+            except Exception:
+                # Fall back to a stale cached copy if the refetch failed.
+                if not path.exists():
+                    raise
 
-                    entry = json.loads(line)
-                    if entry.get("CIDR") == prefix:
-                        routes.append(
-                            BGPRoute(
-                                prefix=entry["CIDR"],
-                                origin_asn=entry.get("ASN", 0),
-                                as_path=[entry.get("ASN", 0)],
-                                communities=[],
-                                peer_asn=0,
-                                peer_ip="",
-                                timestamp="",
-                                collector="bgp.tools",
-                            )
+        routes = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("CIDR") == prefix:
+                    routes.append(
+                        BGPRoute(
+                            prefix=entry["CIDR"],
+                            origin_asn=entry.get("ASN", 0),
+                            as_path=[entry.get("ASN", 0)],
+                            communities=[],
+                            peer_asn=0,
+                            peer_ip="",
+                            timestamp="",
+                            collector="bgp.tools",
                         )
+                    )
                     if len(routes) >= 20:
                         break
 
@@ -454,7 +499,9 @@ def _bgptools_load_asn_cache() -> dict[int, str]:
         _bgptools_asn_cache = cache
         return cache
     except Exception:
-        _bgptools_asn_cache = {}
+        # Don't poison the cache on a transient failure — leave it unset so
+        # the next lookup retries the download instead of returning empty
+        # for the lifetime of the process.
         return {}
 
 
@@ -925,9 +972,6 @@ def _bgp_historical_lookup(
         else:
             files_to_parse = items
 
-        # Enforce cache size limit before downloading
-        _enforce_cache_limit(cache_dir, cfg.mrt_max_cache_gb)
-
         entries = []
         parsed_url = ""
         for mrt_item in files_to_parse:
@@ -938,8 +982,14 @@ def _bgp_historical_lookup(
             if local_path.exists():
                 parse_target = str(local_path)
             else:
-                # Download to cache, then parse locally
+                # Download to cache, then parse locally. Enforce the cache size
+                # limit *after* the download (you can't evict to make room for a
+                # file you haven't fetched yet), keeping the file we just pulled.
                 local_path = _download_mrt(mrt_item.url, cache_dir)
+                if local_path is not None:
+                    _enforce_cache_limit(
+                        cache_dir, cfg.mrt_max_cache_gb, keep=local_path
+                    )
                 parse_target = str(local_path) if local_path else mrt_item.url
 
             parser = bgpkit.Parser(url=parse_target, filters={"prefix": prefix})
@@ -1039,17 +1089,26 @@ def _download_mrt(url: str, cache_dir: Path) -> Path | None:
         return None
 
 
-def _enforce_cache_limit(cache_dir: Path, max_gb: float) -> None:
-    """Remove oldest cached MRT files if total cache exceeds max_gb."""
+def _enforce_cache_limit(
+    cache_dir: Path, max_gb: float, keep: Path | None = None
+) -> None:
+    """Remove oldest cached MRT files if total cache exceeds max_gb.
+
+    `keep`, if given, is never evicted — used to protect a file that was just
+    downloaded and is about to be parsed.
+    """
     if not cache_dir.exists():
         return
 
+    keep_resolved = keep.resolve() if keep else None
     max_bytes = max_gb * 1024 * 1024 * 1024
     files = sorted(cache_dir.rglob("*.gz"), key=lambda p: p.stat().st_mtime)
     total = sum(f.stat().st_size for f in files)
 
     while total > max_bytes and files:
         oldest = files.pop(0)
+        if keep_resolved is not None and oldest.resolve() == keep_resolved:
+            continue
         total -= oldest.stat().st_size
         oldest.unlink()
 
@@ -1076,6 +1135,10 @@ def _ripestat_route_lookup(
                 as_path_str = peer.get("as_path", "")
                 as_path = [int(a) for a in as_path_str.split() if a.isdigit()]
                 origin_asn = as_path[-1] if as_path else 0
+                # The peer ASN is the collector's direct neighbour — the first
+                # hop of the AS path — not the route's origin (which is the
+                # last hop). RIPEstat's `asn_origin` field is the origin AS.
+                peer_asn = as_path[0] if as_path else int(peer.get("peer_asn", 0))
                 community = peer.get("community", "")
                 if isinstance(community, str):
                     communities = [c.strip() for c in community.split(",") if c.strip()]
@@ -1087,7 +1150,7 @@ def _ripestat_route_lookup(
                         origin_asn=origin_asn,
                         as_path=as_path,
                         communities=communities,
-                        peer_asn=int(peer.get("asn_origin", peer.get("peer_asn", 0))),
+                        peer_asn=peer_asn,
                         peer_ip=peer.get("peer", peer.get("ip", "")),
                         timestamp=peer.get("latest_time", ""),
                         collector=rrc_name,

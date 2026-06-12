@@ -25,3 +25,10 @@ default_collector = "rrc00"
 [dns]
 # Default DNS resolver
 resolver = "1.1.1.1"
+
+[local]
+# Active local diagnostic tools (local_nmap, local_curl) can scan or fetch
+# arbitrary network targets from this host — including internal services and
+# cloud metadata endpoints. They are disabled by default. Set to true to
+# enable, or set NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS=1.
+# allow_active_tools = false

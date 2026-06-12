@@ -20,6 +20,15 @@ from pathlib import Path
 _config: NetMCPConfig | None = None
 
 
+def _as_bool(value: object) -> bool:
+    """Coerce an env-var string or TOML bool into a bool."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class NetMCPConfig:
     def __init__(self) -> None:
         raw = _load_config_file()
@@ -61,6 +70,13 @@ class NetMCPConfig:
         self.default_dns_resolver: str = (
             os.environ.get("NET_MCP_DNS_RESOLVER")
             or raw.get("dns", {}).get("resolver", "1.1.1.1")
+        )
+
+        local = raw.get("local", {})
+        self.allow_active_local_tools: bool = _as_bool(
+            os.environ.get("NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS")
+            if os.environ.get("NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS") is not None
+            else local.get("allow_active_tools", False)
         )
 
     def ensure_mrt_cache_dir(self) -> Path:

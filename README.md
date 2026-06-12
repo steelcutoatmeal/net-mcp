@@ -118,6 +118,8 @@ Tools that run standard CLI commands on the user's machine. All inputs are valid
 
 Tools that require admin privileges will attempt to run and return a clear error message if permission is denied. Cross-platform: macOS, Linux, and Windows.
 
+**Active tools (`local_nmap`, `local_curl`) are disabled by default.** Because this server can be driven by an LLM, the ability to port-scan or fetch arbitrary URLs from the host machine is an SSRF/scanning surface (internal services, cloud metadata endpoints). Enable them deliberately by setting `allow_active_tools = true` under `[local]` in `config.toml`, or `NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS=1`. When disabled, they return a clear message explaining how to turn them on.
+
 ## Data Sources
 
 Data sources are queried in this priority order:
@@ -194,6 +196,11 @@ default_collector = "rrc00"
 [dns]
 # Default DNS resolver
 resolver = "1.1.1.1"
+
+[local]
+# Enable active local tools (local_nmap, local_curl). Off by default because
+# they can scan/fetch arbitrary targets (internal services, metadata endpoints).
+allow_active_tools = false
 ```
 
 ### Environment Variables
@@ -205,6 +212,7 @@ resolver = "1.1.1.1"
 | `NET_MCP_MRT_MAX_CACHE_GB` | Max cache size before evicting old files | `10` |
 | `NET_MCP_DEFAULT_COLLECTOR` | Default RIPE RIS collector ID | `rrc00` |
 | `NET_MCP_DNS_RESOLVER` | Default DNS resolver IP | `1.1.1.1` |
+| `NET_MCP_ALLOW_ACTIVE_LOCAL_TOOLS` | Enable `local_nmap` / `local_curl` | `0` (disabled) |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare Radar API token ([get one free](https://dash.cloudflare.com/profile/api-tokens)) | (none) |
 | `BGPROUTES_API_KEY` | bgproutes.io API key | (none) |
 

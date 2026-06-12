@@ -6,6 +6,7 @@ Pure computation — no external APIs. Handles IPv4 and IPv6.
 from __future__ import annotations
 
 import ipaddress
+import itertools
 from typing import Annotated
 
 from fastmcp import FastMCP
@@ -191,12 +192,15 @@ def register_iptools(mcp: FastMCP) -> None:
         if new_prefix_length > max_len:
             raise ValueError(f"Prefix length cannot exceed {max_len} for IPv{net.version}")
 
-        subnets = [str(s) for s in net.subnets(new_prefix=new_prefix_length)]
-
-        # Cap output for very large splits
-        total = len(subnets)
-        if total > 256:
-            subnets = subnets[:256]
+        # Compute the count arithmetically and only materialize the first 256
+        # subnets — net.subnets() is a generator, so a /8 -> /32 split (16.7M
+        # subnets) or a large IPv6 split never builds the full list.
+        total = 1 << (new_prefix_length - net.prefixlen)
+        CAP = 256
+        subnets = [
+            str(s)
+            for s in itertools.islice(net.subnets(new_prefix=new_prefix_length), CAP)
+        ]
 
         return SubnetSplitResult(
             original=str(net),
@@ -219,10 +223,24 @@ def register_iptools(mcp: FastMCP) -> None:
 
         try:
             addr = ipaddress.ip_address(address)
+            if addr.version != net.version:
+                return ContainsResult(
+                    address=address,
+                    network=str(net),
+                    contains=False,
+                    detail=f"{address} is IPv{addr.version} but {net} is IPv{net.version} — cannot be contained.",
+                )
             contained = addr in net
             detail = f"{address} {'is' if contained else 'is NOT'} within {net}"
         except ValueError:
             subnet = ipaddress.ip_network(address, strict=False)
+            if subnet.version != net.version:
+                return ContainsResult(
+                    address=address,
+                    network=str(net),
+                    contains=False,
+                    detail=f"{subnet} is IPv{subnet.version} but {net} is IPv{net.version} — cannot be a subnet.",
+                )
             contained = subnet.subnet_of(net)
             detail = f"{subnet} {'is' if contained else 'is NOT'} a subnet of {net}"
 

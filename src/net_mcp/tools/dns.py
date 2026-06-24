@@ -143,7 +143,6 @@ def register_dns_tools(mcp: FastMCP) -> None:
     @mcp.tool(tags={"dns", "dnssec"})
     def dns_trace(
         name: Annotated[str, Field(description="Domain name to trace (e.g. 'example.com')")],
-        record_type: Annotated[str, Field(description="DNS record type to trace")] = "A",
     ) -> DNSTraceResult:
         """Trace DNS resolution from root to authoritative nameservers.
 
@@ -152,11 +151,13 @@ def register_dns_tools(mcp: FastMCP) -> None:
         that are not their own zone (e.g. 'www' as a record inside a parent
         zone) are skipped so they are not mistaken for a broken delegation.
 
+        This traces the delegation/chain-of-trust structure, which is
+        independent of any particular record type.
+
         A DNSSEC break is reported when a zone is signed (publishes DNSKEY)
         but its parent publishes no DS record for it — an "island of
         security" that breaks the chain of trust.
         """
-        record_type = record_type.upper()
         target = dns.name.from_text(name)
         labels = str(target).rstrip(".").split(".")
 
@@ -186,7 +187,6 @@ def register_dns_tools(mcp: FastMCP) -> None:
 
         return DNSTraceResult(
             query_name=name,
-            query_type=record_type,
             delegation_chain=chain,
             dnssec_chain_intact=chain_intact,
             break_point=break_point,

@@ -46,6 +46,14 @@ BGP_TOOLS_HEADERS = {"User-Agent": "net-mcp/0.1.0 (https://github.com/net-mcp)"}
 BGPROUTES_API_BASE = "https://api.bgproutes.io/v1"
 HTTP_TIMEOUT = 30
 
+# Max prefixes per family returned by bgp_asn_info — large ASes announce
+# tens of thousands; the full count is still reported via total_prefixes.
+_ASN_PREFIX_CAP = 100
+
+# Max MRT files listed by mrt_search — a multi-day 'update' window is one file
+# every 5 minutes; the full count is still reported via `total`.
+_MRT_FILE_CAP = 200
+
 
 def _get_bgproutes_key() -> str | None:
     """Return bgproutes.io API key from config or environment."""
@@ -308,13 +316,27 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         prefixes_v4, prefixes_v6 = _get_announced_prefixes(asn)
         upstreams = _get_upstreams(asn)
 
+        # A large transit AS announces tens of thousands of prefixes. Returning
+        # them all would flood the model's context, so cap each list and report
+        # the true counts via total_prefixes / note. The full lists are still
+        # available via bgp_route_lookup or announced-prefixes per prefix.
+        total = len(prefixes_v4) + len(prefixes_v6)
+        note = ""
+        if len(prefixes_v4) > _ASN_PREFIX_CAP or len(prefixes_v6) > _ASN_PREFIX_CAP:
+            note = (
+                f"Prefix lists truncated to {_ASN_PREFIX_CAP} each of "
+                f"{len(prefixes_v4)} IPv4 / {len(prefixes_v6)} IPv6 announced. "
+                "total_prefixes reflects the full count."
+            )
+
         return ASNInfo(
             asn=asn,
             name=name,
-            prefixes_v4=prefixes_v4,
-            prefixes_v6=prefixes_v6,
+            prefixes_v4=prefixes_v4[:_ASN_PREFIX_CAP],
+            prefixes_v6=prefixes_v6[:_ASN_PREFIX_CAP],
             upstream_asns=upstreams,
-            total_prefixes=len(prefixes_v4) + len(prefixes_v6),
+            total_prefixes=total,
+            note=note,
         )
 
     @mcp.tool(tags={"bgp", "security"})
@@ -650,6 +672,20 @@ def _cloudflare_route_lookup(prefix: str) -> BGPRouteLookupResult | None:
     )
 
 
+def _first(d: dict, *keys, default=None):
+    """Return the first present key's value from d, else default.
+
+    Cloudflare's BGP event field names are not contractually stable and could
+    not be verified against the live API here (no token in CI). Trying a few
+    plausible aliases makes parsing resilient to a renamed field rather than
+    silently returning zeros for every event.
+    """
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
 def _cloudflare_hijacks(
     prefix: str | None,
     asn: int | None,
@@ -688,21 +724,26 @@ def _cloudflare_hijacks(
     result = data.get("result", {})
     events = []
     for e in result.get("events", []):
+        ongoing_count = _first(e, "on_going_count", "ongoing_count", default=0)
+        is_ongoing = e.get(
+            "is_ongoing",
+            ongoing_count > 0 if isinstance(ongoing_count, (int, float)) else False,
+        )
         events.append(
             BGPHijackEvent(
-                id=e.get("id", 0),
-                confidence_score=e.get("confidence_score", 0),
-                hijacker_asn=e.get("hijacker_asn", 0),
-                victim_asns=e.get("victim_asns", []),
-                prefixes=e.get("prefixes", []),
-                hijacker_country=e.get("hijacker_country"),
-                victim_countries=e.get("victim_countries", []),
-                duration=e.get("duration", 0),
-                is_ongoing=e.get("on_going_count", 0) > 0,
-                detected_at=e.get("min_hijack_ts", ""),
-                last_seen=e.get("max_hijack_ts", ""),
-                peer_count=e.get("peer_ip_count", 0),
-                tags=[t.get("name", "") for t in e.get("tags", [])],
+                id=_first(e, "id", default=0),
+                confidence_score=_first(e, "confidence_score", "confidence", default=0),
+                hijacker_asn=_first(e, "hijacker_asn", "hijack_asn", default=0),
+                victim_asns=_first(e, "victim_asns", "victims", default=[]),
+                prefixes=_first(e, "prefixes", default=[]),
+                hijacker_country=_first(e, "hijacker_country"),
+                victim_countries=_first(e, "victim_countries", default=[]),
+                duration=_first(e, "duration", default=0),
+                is_ongoing=bool(is_ongoing),
+                detected_at=_first(e, "min_hijack_ts", "start_time", default=""),
+                last_seen=_first(e, "max_hijack_ts", "end_time", default=""),
+                peer_count=_first(e, "peer_ip_count", "peer_count", default=0),
+                tags=[t.get("name", "") for t in _first(e, "tags", default=[])],
             )
         )
 
@@ -747,17 +788,17 @@ def _cloudflare_leaks(
     for e in result.get("events", []):
         events.append(
             BGPLeakEvent(
-                id=e.get("id", 0),
-                leak_asn=e.get("leak_asn", 0),
-                leak_segment=e.get("leak_seg", []),
-                leak_type=e.get("leak_type", 0),
-                origin_count=e.get("origin_count", 0),
-                prefix_count=e.get("prefix_count", 0),
-                peer_count=e.get("peer_count", 0),
-                countries=e.get("countries", []),
-                detected_at=e.get("min_ts", ""),
-                last_seen=e.get("max_ts", ""),
-                finished=e.get("finished", False),
+                id=_first(e, "id", default=0),
+                leak_asn=_first(e, "leak_asn", "leaker_asn", default=0),
+                leak_segment=_first(e, "leak_seg", "leak_segment", default=[]),
+                leak_type=_first(e, "leak_type", default=0),
+                origin_count=_first(e, "origin_count", default=0),
+                prefix_count=_first(e, "prefix_count", default=0),
+                peer_count=_first(e, "peer_count", "peer_ip_count", default=0),
+                countries=_first(e, "countries", default=[]),
+                detected_at=_first(e, "min_ts", "start_time", default=""),
+                last_seen=_first(e, "max_ts", "end_time", default=""),
+                finished=_first(e, "finished", default=False),
             )
         )
 
@@ -883,6 +924,13 @@ def _mrt_search(
                 )
             )
 
+        # A wide 'update' window yields one file every 5 minutes — thousands of
+        # entries for a multi-day range. Cap the returned list; `total` still
+        # reports how many files actually exist in the range.
+        total_files = len(files)
+        truncated = total_files > _MRT_FILE_CAP
+        files = files[:_MRT_FILE_CAP]
+
         if data_type == "rib":
             tip = (
                 "RIB files are full routing table snapshots (~400MB). They are "
@@ -898,13 +946,19 @@ def _mrt_search(
                 "These parse in seconds."
             )
 
+        if truncated:
+            tip = (
+                f"Showing the first {_MRT_FILE_CAP} of {total_files} files in "
+                f"this range — narrow the time window for the rest. " + tip
+            )
+
         return MRTSearchResult(
             query_start=time_start,
             query_end=time_end,
             collector=collector,
             data_type=data_type,
             files=files,
-            total=len(files),
+            total=total_files,
             tip=tip,
         )
     except Exception as e:
@@ -1210,11 +1264,29 @@ def _get_announced_prefixes(asn: int) -> tuple[list[str], list[str]]:
             pfx = entry.get("prefix", "")
             if ":" in pfx:
                 v6.append(pfx)
-            else:
+            elif pfx:
                 v4.append(pfx)
-        return sorted(v4), sorted(v6)
+        return _sort_prefixes(v4), _sort_prefixes(v6)
     except Exception:
         return [], []
+
+
+def _sort_prefixes(prefixes: list[str]) -> list[str]:
+    """Sort prefixes numerically by network address (not lexicographically).
+
+    Lexicographic sort places '100.0.0.0/8' before '11.0.0.0/8'; numeric sort
+    keeps the order sensible, which matters when the list is later truncated.
+    """
+    import ipaddress
+
+    def key(p: str):
+        try:
+            net = ipaddress.ip_network(p, strict=False)
+            return (int(net.network_address), net.prefixlen)
+        except ValueError:
+            return (0, 0)
+
+    return sorted(prefixes, key=key)
 
 
 def _get_upstreams(asn: int) -> list[int]:

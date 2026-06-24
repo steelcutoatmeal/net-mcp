@@ -159,8 +159,15 @@ def register_local_tools(mcp: FastMCP) -> None:
         count = min(count, 100)  # cap to prevent abuse
 
         if _IS_WINDOWS:
+            # Windows ping: -w is the per-reply timeout in milliseconds.
             cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), host]
+        elif _IS_MACOS:
+            # macOS/BSD ping: -W is the per-packet wait in MILLISECONDS. Passing
+            # seconds here (e.g. -W 5) waits only 5ms, so any reply slower than
+            # that is reported as "out of wait time" / lost.
+            cmd = ["ping", "-c", str(count), "-W", str(timeout * 1000), host]
         else:
+            # Linux iputils ping: -W is the per-packet wait in SECONDS.
             cmd = ["ping", "-c", str(count), "-W", str(timeout), host]
 
         rc, out, err = _run(cmd, timeout=count * timeout + 10)

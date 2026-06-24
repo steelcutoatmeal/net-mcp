@@ -34,6 +34,11 @@ _MAX_SET_DEPTH = 6
 _MAX_SET_MEMBERS = 20000
 _ASN_RE = re.compile(r"^AS\d+$", re.IGNORECASE)
 
+# Max route objects returned by irr_route_lookup. A busy origin AS has thousands
+# of route objects across mirrored registries; returning them all floods the
+# model's context. The full count is still reported via `total`.
+_MAX_ROUTE_OBJECTS = 200
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -131,9 +136,11 @@ def register_irr_tools(mcp: FastMCP) -> None:
 
             objects.extend(_parse_route_objects(raw, source))
 
+        # Cap the returned list to keep responses bounded; `total` keeps the
+        # real count so the caller knows the result was truncated.
         return IRRRouteLookupResult(
             query=query,
-            objects=objects,
+            objects=objects[:_MAX_ROUTE_OBJECTS],
             total=len(objects),
             sources=source_list,
         )

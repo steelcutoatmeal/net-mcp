@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import net_mcp.tools.bgp as bgp
+from net_mcp.server import mcp
 
 
 def test_ripestat_route_lookup_peer_asn(monkeypatch):
@@ -103,3 +104,46 @@ def test_asn_cache_not_poisoned_on_failure(monkeypatch):
     monkeypatch.setattr(bgp.httpx, "Client", FakeClient)
     assert bgp._bgptools_load_asn_cache() == {}
     assert bgp._bgptools_asn_cache is None  # not poisoned
+
+
+def test_sort_prefixes_is_numeric_not_lexicographic():
+    # Lexicographic order would put 100.0.0.0/8 before 11.0.0.0/8.
+    out = bgp._sort_prefixes(["11.0.0.0/8", "100.0.0.0/8", "9.0.0.0/8"])
+    assert out == ["9.0.0.0/8", "11.0.0.0/8", "100.0.0.0/8"]
+
+
+def test_first_prefers_present_keys_and_skips_none():
+    assert bgp._first({"a": 1}, "a", "b") == 1
+    assert bgp._first({"b": 2}, "a", "b") == 2
+    # None is treated as missing so a real fallback can win.
+    assert bgp._first({"a": None, "b": 5}, "a", "b") == 5
+    assert bgp._first({}, "a", default=7) == 7
+
+
+async def test_bgp_asn_info_caps_prefix_lists(monkeypatch):
+    # A large AS announces far more than the cap; the lists are truncated but
+    # total_prefixes stays exact and a truncation note is set.
+    v4 = [f"10.{i}.0.0/24" for i in range(150)]
+    v6 = [f"2001:db8:{i:x}::/48" for i in range(150)]
+    monkeypatch.setattr(bgp, "_get_as_name", lambda asn: "TESTAS")
+    monkeypatch.setattr(bgp, "_get_announced_prefixes", lambda asn: (v4, v6))
+    monkeypatch.setattr(bgp, "_get_upstreams", lambda asn: [1, 2])
+
+    res = await mcp.call_tool("bgp_asn_info", {"asn": 64500})
+    data = res.structured_content
+    assert len(data["prefixes_v4"]) == bgp._ASN_PREFIX_CAP
+    assert len(data["prefixes_v6"]) == bgp._ASN_PREFIX_CAP
+    assert data["total_prefixes"] == 300
+    assert data["note"]  # truncation note present
+
+
+async def test_bgp_asn_info_small_as_not_truncated(monkeypatch):
+    monkeypatch.setattr(bgp, "_get_as_name", lambda asn: "SMALLAS")
+    monkeypatch.setattr(bgp, "_get_announced_prefixes", lambda asn: (["1.1.1.0/24"], []))
+    monkeypatch.setattr(bgp, "_get_upstreams", lambda asn: [])
+
+    res = await mcp.call_tool("bgp_asn_info", {"asn": 64501})
+    data = res.structured_content
+    assert data["prefixes_v4"] == ["1.1.1.0/24"]
+    assert data["total_prefixes"] == 1
+    assert data["note"] == ""

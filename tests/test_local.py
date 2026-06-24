@@ -84,3 +84,35 @@ async def test_nmap_gate_can_be_enabled(monkeypatch):
     monkeypatch.setattr(local_mod, "get_config", lambda: _Cfg(True))
     res = await mcp.call_tool("local_nmap", {"target": "127.0.0.1", "ports": "1-10"})
     assert "disabled" not in res.structured_content["stderr"].lower()
+
+
+def _capture_ping_cmd(monkeypatch):
+    """Stub _run so local_ping doesn't actually ping; capture the argv."""
+    captured = {}
+
+    def fake_run(cmd, timeout=30):
+        captured["cmd"] = cmd
+        return 0, "ok", ""
+
+    monkeypatch.setattr(local_mod, "_run", fake_run)
+    return captured
+
+
+async def test_ping_macos_uses_milliseconds(monkeypatch):
+    # macOS/BSD ping -W is per-packet wait in milliseconds, so timeout=5 -> 5000.
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+    monkeypatch.setattr(local_mod, "_IS_MACOS", True)
+    _capture_ping_cmd(monkeypatch)
+    res = await mcp.call_tool("local_ping", {"host": "1.1.1.1", "count": 2, "timeout": 5})
+    tokens = res.structured_content["command"].split()
+    assert tokens[tokens.index("-W") + 1] == "5000"
+
+
+async def test_ping_linux_uses_seconds(monkeypatch):
+    # Linux iputils ping -W is in seconds, so timeout=5 stays 5.
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+    monkeypatch.setattr(local_mod, "_IS_MACOS", False)
+    _capture_ping_cmd(monkeypatch)
+    res = await mcp.call_tool("local_ping", {"host": "1.1.1.1", "count": 2, "timeout": 5})
+    tokens = res.structured_content["command"].split()
+    assert tokens[tokens.index("-W") + 1] == "5"

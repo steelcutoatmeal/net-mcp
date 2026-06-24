@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from net_mcp.tools.rpki import _build_detail, _parse_roas
+import net_mcp.tools.rpki as rpki
+from net_mcp.tools.rpki import _build_detail, _parse_roas, _roas_for_prefix
 
 
 def test_build_detail_valid():
@@ -45,3 +46,26 @@ def test_parse_roas():
 
 def test_parse_roas_empty():
     assert _parse_roas([]) == []
+
+
+def test_roas_for_prefix_parses(monkeypatch):
+    fake = {
+        "data": {
+            "validating_roas": [
+                {"prefix": "1.1.1.0/24", "max_length": 24, "origin": 13335, "source": "RIPE"}
+            ]
+        }
+    }
+    monkeypatch.setattr(rpki, "ripestat_get", lambda *a, **k: fake)
+    roas = _roas_for_prefix("13335", "1.1.1.0/24")
+    assert len(roas) == 1
+    assert roas[0].asn == 13335
+
+
+def test_roas_for_prefix_swallows_errors(monkeypatch):
+    # The parallel ASN scan must never let one failed prefix raise.
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(rpki, "ripestat_get", boom)
+    assert _roas_for_prefix("13335", "1.1.1.0/24") == []

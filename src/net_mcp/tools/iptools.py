@@ -58,6 +58,15 @@ _BOGON_V6 = [
 _BOGON_NETS_V4 = [(ipaddress.ip_network(p), desc) for p, desc in _BOGON_V4]
 _BOGON_NETS_V6 = [(ipaddress.ip_network(p), desc) for p, desc in _BOGON_V6]
 
+# JSON numbers above 2^53 lose precision in JS-based clients. Emit such counts
+# (common for IPv6 ranges) as exact decimal strings instead.
+_JS_SAFE_INT_MAX = 2 ** 53
+
+
+def _count(n: int) -> int | str:
+    """Return n as an int, or a decimal string if it exceeds JS-safe precision."""
+    return n if n <= _JS_SAFE_INT_MAX else str(n)
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -71,8 +80,12 @@ class SubnetInfo(BaseModel):
     netmask: str
     hostmask: str
     prefix_length: int
-    total_addresses: int
-    usable_hosts: int
+    total_addresses: int | str = Field(
+        description="Total addresses; a decimal string when it exceeds 2^53 (large IPv6 ranges)"
+    )
+    usable_hosts: int | str = Field(
+        description="Usable hosts; a decimal string when it exceeds 2^53 (large IPv6 ranges)"
+    )
     ip_version: int
     is_private: bool
     is_global: bool
@@ -85,7 +98,9 @@ class SubnetSplitResult(BaseModel):
     original: str
     new_prefix_length: int
     subnets: list[str]
-    total: int
+    total: int | str = Field(
+        description="Total subnet count; a decimal string when it exceeds 2^53 (large IPv6 splits)"
+    )
 
 
 class ContainsResult(BaseModel):
@@ -158,8 +173,8 @@ def register_iptools(mcp: FastMCP) -> None:
             netmask=str(net.netmask),
             hostmask=str(net.hostmask),
             prefix_length=net.prefixlen,
-            total_addresses=net.num_addresses,
-            usable_hosts=usable,
+            total_addresses=_count(net.num_addresses),
+            usable_hosts=_count(usable),
             ip_version=net.version,
             is_private=net.is_private,
             is_global=net.is_global,
@@ -206,7 +221,7 @@ def register_iptools(mcp: FastMCP) -> None:
             original=str(net),
             new_prefix_length=new_prefix_length,
             subnets=subnets,
-            total=total,
+            total=_count(total),
         )
 
     @mcp.tool(tags={"ip", "subnet"})
@@ -357,16 +372,28 @@ def register_iptools(mcp: FastMCP) -> None:
             net = ipaddress.ip_network(f"{addr}/{pfx_len}")
 
         bogon_list = _BOGON_NETS_V4 if net.version == 4 else _BOGON_NETS_V6
-        matches = []
+        matches = []   # query is fully within (or equal to) a reserved range
+        partial = []   # query is an aggregate that merely straddles a reserved range
 
         for bogon_net, desc in bogon_list:
-            if net.overlaps(bogon_net):
+            if net.subnet_of(bogon_net):
                 matches.append(f"{bogon_net} — {desc}")
+            elif net.overlaps(bogon_net):
+                partial.append(f"{bogon_net} — {desc}")
 
+        # Only flag as a bogon when the query is itself reserved. A large
+        # aggregate (e.g. 100.0.0.0/8) that merely contains a smaller reserved
+        # block (100.64.0.0/10) is mostly routable, so it is reported as a
+        # partial overlap rather than a false-positive bogon.
         is_bogon = len(matches) > 0
 
         if is_bogon:
             detail = f"{query} is a bogon/reserved address. Matches {len(matches)} reserved range(s)."
+        elif partial:
+            detail = (
+                f"{query} is NOT itself a bogon, but as an aggregate it overlaps "
+                f"{len(partial)} reserved range(s): {', '.join(partial)}. The rest is routable."
+            )
         else:
             detail = f"{query} is NOT a bogon. It is a globally routable {'IPv4' if net.version == 4 else 'IPv6'} prefix."
 

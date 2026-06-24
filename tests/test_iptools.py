@@ -125,3 +125,35 @@ async def test_bogon_check_global():
 async def test_bogon_check_ipv6_documentation():
     data = await _call("bogon_check", {"query": "2001:db8::/32"})
     assert data["is_bogon"] is True
+
+
+async def test_bogon_check_aggregate_partial_overlap_not_flagged():
+    # 100.0.0.0/8 contains the CGNAT block 100.64.0.0/10 but is mostly routable,
+    # so it must NOT be reported as a bogon — only as a partial overlap.
+    data = await _call("bogon_check", {"query": "100.0.0.0/8"})
+    assert data["is_bogon"] is False
+    assert data["matches"] == []
+    assert "overlap" in data["detail"].lower()
+
+
+async def test_subnet_info_ipv4_counts_stay_int():
+    # Small counts must remain JSON numbers (not strings) for ergonomics.
+    data = await _call("subnet_info", {"prefix": "10.0.0.0/24"})
+    assert data["total_addresses"] == 256
+    assert isinstance(data["total_addresses"], int)
+    assert isinstance(data["usable_hosts"], int)
+
+
+async def test_subnet_info_ipv6_huge_count_is_decimal_string():
+    # 2001:db8::/32 has 2^96 addresses — beyond JS-safe integer precision, so it
+    # must be returned as an exact decimal string rather than a lossy number.
+    data = await _call("subnet_info", {"prefix": "2001:db8::/32"})
+    assert data["total_addresses"] == str(2 ** 96)
+    assert isinstance(data["total_addresses"], str)
+
+
+async def test_subnet_split_ipv6_huge_total_is_decimal_string():
+    data = await _call("subnet_split", {"prefix": "2000::/16", "new_prefix_length": 96})
+    assert data["total"] == str(2 ** 80)
+    assert isinstance(data["total"], str)
+    assert len(data["subnets"]) == 256

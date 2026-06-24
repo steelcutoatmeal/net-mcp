@@ -25,6 +25,17 @@ from net_mcp.models import (
 
 HTTP_TIMEOUT = 15
 
+# Per-prefix RPKI lookups for an ASN query are fanned out across a thread pool.
+# Cap how many announced prefixes we scan and how many run concurrently so the
+# tool returns within a sane wall-clock even for large ASes.
+_ASN_PREFIX_SCAN_CAP = 50
+_ROA_LOOKUP_WORKERS = 16
+_ROA_LOOKUP_TIMEOUT = 10
+
+# Max ASPA objects returned by rpki_aspa_lookup. An unfiltered snapshot is the
+# entire dataset; the full count is still reported via `total`.
+_ASPA_OBJECT_CAP = 200
+
 
 def register_rpki_tools(mcp: FastMCP) -> None:
     @mcp.tool(tags={"rpki", "security"})
@@ -38,8 +49,10 @@ def register_rpki_tools(mcp: FastMCP) -> None:
         or NOT_FOUND in RPKI. Returns matching ROAs and details about any
         max-length issues.
 
-        Queries RIPEstat (returns ROA details) and Cloudflare Radar
-        (faster, includes RPKI status). Uses whichever responds first.
+        Queries RIPEstat first for full ROA details. If RIPEstat returns
+        NOT_FOUND, Cloudflare Radar is consulted to confirm the status. If
+        RIPEstat is unavailable entirely, falls back to Cloudflare Radar
+        (status only, no ROA details).
         """
         # 1. RIPEstat — returns full ROA details
         result = _validate_ripestat(prefix, origin_asn)
@@ -99,7 +112,7 @@ def register_rpki_tools(mcp: FastMCP) -> None:
                 roas = _parse_roas(data.get("validating_roas", []))
                 return ROALookupResult(query=query, roas=roas, total=len(roas))
             else:
-                # ASN query — get announced prefixes first, then check ROAs
+                # ASN query — get announced prefixes first, then check ROAs.
                 pfx_data = ripestat_get(
                     "announced-prefixes/data.json",
                     params={"resource": f"AS{query}"},
@@ -107,20 +120,27 @@ def register_rpki_tools(mcp: FastMCP) -> None:
                 ).get("data", {})
                 prefixes_list = pfx_data.get("prefixes", [])
 
-                all_roas = []
-                for pfx_entry in prefixes_list[:50]:
-                    pfx = pfx_entry.get("prefix", "")
-                    if not pfx:
-                        continue
-                    try:
-                        d = ripestat_get(
-                            "rpki-validation/data.json",
-                            params={"resource": query, "prefix": pfx},
-                            timeout=HTTP_TIMEOUT,
-                        ).get("data", {})
-                        all_roas.extend(_parse_roas(d.get("validating_roas", [])))
-                    except Exception:
-                        continue
+                targets = [
+                    p.get("prefix", "")
+                    for p in prefixes_list[:_ASN_PREFIX_SCAN_CAP]
+                    if p.get("prefix")
+                ]
+
+                # Run the per-prefix RPKI lookups concurrently. Done serially
+                # (the previous behaviour) this is 50 × up-to-15s requests, which
+                # blows past any MCP client timeout; a thread pool bounds the
+                # wall-clock to a few batches.
+                all_roas: list[ROA] = []
+                if targets:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(_ROA_LOOKUP_WORKERS, len(targets))
+                    ) as pool:
+                        for roas in pool.map(
+                            lambda pfx: _roas_for_prefix(query, pfx), targets
+                        ):
+                            all_roas.extend(roas)
 
                 # Deduplicate
                 seen = set()
@@ -190,8 +210,11 @@ def register_rpki_tools(mcp: FastMCP) -> None:
         asn_info = result.get("asnInfo", {})
         meta = result.get("meta", {})
 
+        raw_objects = result.get("aspaObjects", [])
         objects = []
-        for obj in result.get("aspaObjects", []):
+        # An unfiltered snapshot is the entire ASPA dataset (thousands of
+        # objects). Cap the returned list; `total` reports the real count.
+        for obj in raw_objects[:_ASPA_OBJECT_CAP]:
             customer = obj.get("customerAsn", 0)
             info = asn_info.get(str(customer), {})
             objects.append(
@@ -205,7 +228,7 @@ def register_rpki_tools(mcp: FastMCP) -> None:
 
         return ASPASnapshotResult(
             objects=objects,
-            total=meta.get("totalCount", len(objects)),
+            total=meta.get("totalCount", len(raw_objects)),
             data_time=meta.get("dataTime", ""),
             source="Cloudflare Radar",
         )
@@ -350,6 +373,19 @@ def _validate_cloudflare(prefix: str, origin_asn: int) -> str | None:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _roas_for_prefix(query: str, prefix: str) -> list[ROA]:
+    """Fetch the validating ROAs for one (ASN, prefix) pair. Never raises."""
+    try:
+        d = ripestat_get(
+            "rpki-validation/data.json",
+            params={"resource": query, "prefix": prefix},
+            timeout=_ROA_LOOKUP_TIMEOUT,
+        ).get("data", {})
+        return _parse_roas(d.get("validating_roas", []))
+    except Exception:
+        return []
 
 
 def _parse_roas(vrps: list[dict]) -> list[ROA]:

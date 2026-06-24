@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import net_mcp.tools.irr as irr
+from net_mcp.server import mcp
 from net_mcp.tools.irr import (
     _looks_like_set,
     _parse_autnum,
@@ -120,3 +121,18 @@ def test_parse_autnum():
 
 def test_parse_autnum_empty_returns_none():
     assert _parse_autnum("% no object found\n", "radb") is None
+
+
+async def test_irr_route_lookup_caps_objects(monkeypatch):
+    # A busy origin AS returns many route objects; the response list is capped
+    # while `total` still reflects the real count.
+    raw = "\n".join(
+        f"route: 10.{i}.0.0/24\norigin: AS64500\nsource: RADB\n" for i in range(5)
+    )
+    monkeypatch.setattr(irr, "_whois_query", lambda server, query, source: raw)
+    monkeypatch.setattr(irr, "_MAX_ROUTE_OBJECTS", 2)
+
+    res = await mcp.call_tool("irr_route_lookup", {"query": "AS64500", "sources": "radb"})
+    data = res.structured_content
+    assert data["total"] == 5
+    assert len(data["objects"]) == 2

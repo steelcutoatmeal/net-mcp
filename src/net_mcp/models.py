@@ -42,7 +42,6 @@ class DelegationStep(BaseModel):
 
 class DNSTraceResult(BaseModel):
     query_name: str
-    query_type: str
     delegation_chain: list[DelegationStep]
     dnssec_chain_intact: bool
     break_point: str | None = Field(
@@ -219,10 +218,19 @@ class PrefixOriginResult(BaseModel):
 class ASNInfo(BaseModel):
     asn: int
     name: str | None = None
-    prefixes_v4: list[str]
-    prefixes_v6: list[str]
+    prefixes_v4: list[str] = Field(
+        description="Announced IPv4 prefixes (may be truncated; see total_prefixes and note)"
+    )
+    prefixes_v6: list[str] = Field(
+        description="Announced IPv6 prefixes (may be truncated; see total_prefixes and note)"
+    )
     upstream_asns: list[int]
-    total_prefixes: int
+    total_prefixes: int = Field(
+        description="Total announced prefix count (v4+v6), even if the lists above are truncated"
+    )
+    note: str = Field(
+        default="", description="Set when the prefix lists were truncated to limit response size"
+    )
 
 
 # --- BGP Hijack / Leak Models ---

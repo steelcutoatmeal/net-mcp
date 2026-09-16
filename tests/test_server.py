@@ -28,6 +28,24 @@ async def test_all_tools_register():
         assert name.startswith(EXPECTED_PREFIXES), f"unexpected tool prefix: {name}"
 
 
+def _has_description(schema: dict) -> bool:
+    """True if the schema node, or any anyOf/allOf/oneOf member, carries a description.
+
+    Pydantic on Python 3.10 nests the description of an ``X | None`` parameter
+    inside an inner ``anyOf`` entry instead of at the top level.
+    """
+    if schema.get("description"):
+        return True
+    for key in ("anyOf", "allOf", "oneOf"):
+        if any(
+            _has_description(sub)
+            for sub in schema.get(key, [])
+            if isinstance(sub, dict)
+        ):
+            return True
+    return False
+
+
 async def test_every_tool_has_llm_facing_contract():
     """The LLM only sees the description and schemas, so none may be empty."""
     for tool in await mcp.list_tools():
@@ -36,7 +54,7 @@ async def test_every_tool_has_llm_facing_contract():
         # Every tool returns a Pydantic model, which FastMCP exposes as an output schema.
         assert tool.output_schema, f"{tool.name} has no output schema"
         for pname, pschema in tool.parameters.get("properties", {}).items():
-            assert pschema.get("description"), (
+            assert _has_description(pschema), (
                 f"{tool.name}.{pname} missing Field(description=...)"
             )
 

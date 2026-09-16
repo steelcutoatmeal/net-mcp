@@ -1,26 +1,41 @@
 """BGP route lookup and analysis tools.
 
-Data sources (in priority order):
-  1. RIPEstat      — Free, no API key. Looking glass, routing status, prefix/ASN data.
-  2. bgproutes.io  — Requires API key (set BGPROUTES_API_KEY env var). RIB snapshots
-                     with RPKI + ASPA validation, BGP updates, AS topology.
-                     Only called when API key is configured.
-  3. bgp.tools     — Free, no API key. Custom User-Agent required. ASN-to-name
-                     mappings (asns.csv), full BGP table (table.jsonl). Last resort.
+Data sources (see each tool's docstring for the order it uses):
+  - RIPEstat        Free, no key. Looking glass, routing status, prefix/ASN
+                    data, RIS collector metadata. Primary for most tools.
+  - Cloudflare Radar Free with API token. Real-time routes, prefix-to-ASN
+                    with RPKI status (primary for bgp_prefix_origin), and the
+                    only source for bgp_hijacks / bgp_leaks.
+  - bgproutes.io    Requires API key. RIB snapshots with RPKI + ASPA
+                    validation, AS topology. Only called when configured.
+  - bgp.tools       Free, no key, custom User-Agent required. ASN-to-name
+                    CSV (cached in memory) and the full BGP table (last resort).
+  - RIPE RIS MRT    Historical RIB dumps / update files via BGPKIT.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import ipaddress
 import json
+import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
-import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from net_mcp import cloudflare_get, ripestat_get
+from net_mcp import (
+    cloudflare_get,
+    cloudflare_unavailable_reason,
+    get_http_client,
+    ripestat_get,
+)
 from net_mcp.config import get_config
 from net_mcp.models import (
     ASNInfo,
@@ -41,10 +56,15 @@ from net_mcp.models import (
     RouteCollectorResult,
 )
 
+logger = logging.getLogger(__name__)
+
 BGP_TOOLS_BASE = "https://bgp.tools"
-BGP_TOOLS_HEADERS = {"User-Agent": "net-mcp/0.1.0 (https://github.com/net-mcp)"}
 BGPROUTES_API_BASE = "https://api.bgproutes.io/v1"
 HTTP_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120  # full-table and MRT downloads
+
+# Max routes returned per lookup; `total` still reports how many were seen.
+_ROUTE_CAP = 20
 
 # Max prefixes per family returned by bgp_asn_info — large ASes announce
 # tens of thousands; the full count is still reported via total_prefixes.
@@ -53,6 +73,33 @@ _ASN_PREFIX_CAP = 100
 # Max MRT files listed by mrt_search — a multi-day 'update' window is one file
 # every 5 minutes; the full count is still reported via `total`.
 _MRT_FILE_CAP = 200
+
+_DATA_TYPES = ("rib", "update")
+
+
+def _normalize_data_type(data_type: str) -> str:
+    dt = data_type.strip().lower()
+    if dt not in _DATA_TYPES:
+        raise ToolError("data_type must be 'rib' or 'update'")
+    return dt
+
+
+def _parse_as_path(raw: str | list | None) -> list[int]:
+    """Normalise an AS path from a space-separated string or a list."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [int(a) for a in raw.split() if a.isdigit()]
+    return [int(a) for a in raw if str(a).isdigit()]
+
+
+def _parse_communities(raw: str | list | None) -> list[str]:
+    """Normalise communities from a comma-separated string or a list."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [c.strip() for c in raw.split(",") if c.strip()]
+    return [str(c) for c in raw]
 
 
 def _get_bgproutes_key() -> str | None:
@@ -83,9 +130,11 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         and peer information. Optionally filter by a specific RIPE RIS collector
         to get a regional perspective (e.g. RRC06 for Tokyo, RRC15 for Sao Paulo).
 
-        Queries RIPEstat and Cloudflare Radar as primary sources (both free).
-        Use ris_collectors first to see which collectors are available and where
-        they are located, then pass a collector ID here for targeted lookups.
+        Source order: RIPEstat looking glass, then Cloudflare Radar (if a
+        token is configured), then bgproutes.io (if a key is configured), then
+        the bgp.tools full table only if RIPEstat itself failed. At most 20
+        routes are returned; `total` reports how many were observed. Use
+        ris_collectors first to pick a collector ID for a regional view.
         """
         # 1a. RIPEstat looking glass (free, no key, reliable)
         ripestat_result = _ripestat_route_lookup(prefix, collector=collector)
@@ -108,7 +157,7 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         #    a true last resort when the primary source actually failed. If
         #    RIPEstat answered successfully but the prefix simply isn't routed,
         #    return that empty result rather than pulling the whole table.
-        if ripestat_result.source.startswith("RIPEstat error"):
+        if ripestat_result.error:
             return _bgptools_route_lookup(prefix)
         return ripestat_result
 
@@ -147,10 +196,7 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         time_start: Annotated[
             str,
             Field(
-                description=(
-                    "Start time in ISO 8601 format (e.g. '2026-03-22T00:00:00') "
-                    "or relative like '2 days ago' converted to ISO 8601."
-                )
+                description="Start time in ISO 8601 format (e.g. '2026-03-22T00:00:00')"
             ),
         ],
         time_end: Annotated[
@@ -178,10 +224,11 @@ def register_bgp_tools(mcp: FastMCP) -> None:
             Field(
                 description=(
                     "RIPE RIS collector ID (e.g. 'rrc00'). Use ris_collectors to "
-                    "find the right one. Defaults to rrc00 (global multihop)."
+                    "find the right one. Defaults to the configured collector "
+                    "(rrc00, global multihop)."
                 )
             ),
-        ] = "rrc00",
+        ] = None,
     ) -> MRTSearchResult:
         """Find available MRT data files for a given time range and collector.
 
@@ -205,7 +252,9 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         ],
         time_start: Annotated[
             str,
-            Field(description="Start time in ISO 8601 format (e.g. '2026-03-22T00:00:00')"),
+            Field(
+                description="Start time in ISO 8601 format (e.g. '2026-03-22T00:00:00')"
+            ),
         ],
         time_end: Annotated[
             str,
@@ -213,12 +262,16 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         ],
         data_type: Annotated[
             str,
-            Field(description="'rib' for routing table snapshot or 'update' for BGP changes"),
+            Field(
+                description="'rib' for routing table snapshot or 'update' for BGP changes"
+            ),
         ] = "rib",
         collector: Annotated[
             str | None,
-            Field(description="RIPE RIS collector ID (e.g. 'rrc00'). Defaults to rrc00."),
-        ] = "rrc00",
+            Field(
+                description="RIPE RIS collector ID (e.g. 'rrc00'). Defaults to the configured collector (rrc00)."
+            ),
+        ] = None,
         max_results: Annotated[
             int, Field(description="Maximum entries to return (default 50)")
         ] = 50,
@@ -248,17 +301,21 @@ def register_bgp_tools(mcp: FastMCP) -> None:
     ) -> PrefixOriginResult:
         """Find which AS(es) originate a given prefix.
 
-        Returns origin ASN(s) with AS name and RPKI validation status.
-        Queries both RIPEstat and Cloudflare Radar (if configured) for
-        comprehensive results including RPKI status.
+        Returns the distinct origin ASN(s) with AS names. Cloudflare Radar
+        (pfx2as) is queried first because it also reports per-origin RPKI
+        status; if it is not configured or returns nothing, RIPEstat
+        routing-status is used (no rpki_status). `error` is set only when
+        every source failed, so an empty `origins` with no error means the
+        prefix is genuinely not announced.
         """
-        origins = []
+        origins: list[PrefixOrigin] = []
+        source = ""
+        errors: list[str] = []
 
         # 1. Cloudflare Radar pfx2as (includes RPKI status per origin)
-        cf_data = cloudflare_get(
-            "radar/bgp/routes/pfx2as", params={"prefix": prefix}
-        )
+        cf_data = cloudflare_get("radar/bgp/routes/pfx2as", params={"prefix": prefix})
         if cf_data and cf_data.get("success"):
+            source = "Cloudflare Radar pfx2as"
             for entry in cf_data.get("result", {}).get("prefix_origins", []):
                 origins.append(
                     PrefixOrigin(
@@ -267,15 +324,16 @@ def register_bgp_tools(mcp: FastMCP) -> None:
                         rpki_status=entry.get("rpki_validation"),
                     )
                 )
+        elif get_config().cloudflare_api_token:
+            errors.append("Cloudflare Radar request failed")
 
-        # 2. RIPEstat fallback/supplement
+        # 2. RIPEstat fallback
         if not origins:
             try:
                 data = ripestat_get(
-                    "routing-status/data.json",
-                    params={"resource": prefix},
+                    "routing-status/data.json", params={"resource": prefix}
                 ).get("data", {})
-
+                source = "RIPEstat routing-status"
                 for entry in data.get("origins", []):
                     origin_asn = entry.get("origin", 0)
                     if origin_asn:
@@ -285,11 +343,12 @@ def register_bgp_tools(mcp: FastMCP) -> None:
                                 origin_asn=origin_asn,
                             )
                         )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("RIPEstat routing-status failed for %s: %s", prefix, exc)
+                errors.append(f"RIPEstat request failed: {exc}")
 
         # Deduplicate by origin ASN
-        seen = set()
+        seen: set[int] = set()
         unique_origins = []
         for o in origins:
             if o.origin_asn and o.origin_asn not in seen:
@@ -300,7 +359,13 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         for origin in unique_origins:
             origin.as_name = _get_as_name(origin.origin_asn)
 
-        return PrefixOriginResult(query_prefix=prefix, origins=unique_origins)
+        error = None
+        if not source and errors:
+            error = "; ".join(errors)
+
+        return PrefixOriginResult(
+            query_prefix=prefix, origins=unique_origins, source=source, error=error
+        )
 
     @mcp.tool(tags={"bgp", "routing"})
     def bgp_asn_info(
@@ -313,7 +378,7 @@ def register_bgp_tools(mcp: FastMCP) -> None:
         AS's footprint on the Internet.
         """
         name = _get_as_name(asn)
-        prefixes_v4, prefixes_v6 = _get_announced_prefixes(asn)
+        prefixes_v4, prefixes_v6, error = _get_announced_prefixes(asn)
         upstreams = _get_upstreams(asn)
 
         # A large transit AS announces tens of thousands of prefixes. Returning
@@ -337,6 +402,7 @@ def register_bgp_tools(mcp: FastMCP) -> None:
             upstream_asns=upstreams,
             total_prefixes=total,
             note=note,
+            error=error,
         )
 
     @mcp.tool(tags={"bgp", "security"})
@@ -371,7 +437,9 @@ def register_bgp_tools(mcp: FastMCP) -> None:
 
         Requires Cloudflare Radar API token (CLOUDFLARE_API_TOKEN).
         """
-        return _cloudflare_hijacks(prefix, asn, date_start, date_end, min_confidence, max_results)
+        return _cloudflare_hijacks(
+            prefix, asn, date_start, date_end, min_confidence, max_results
+        )
 
     @mcp.tool(tags={"bgp", "security"})
     def bgp_leaks(
@@ -411,22 +479,25 @@ _BGPTOOLS_TABLE_TTL = 1800
 
 
 def _bgptools_table_path() -> Path:
-    """Local cache path for the bgp.tools full BGP table."""
-    base = get_config().mrt_cache_dir
-    base.parent.mkdir(parents=True, exist_ok=True)
-    return base.parent / "bgptools-table.jsonl"
+    """Local cache path for the bgp.tools full BGP table (inside the MRT cache dir).
+
+    It is a .jsonl file, so the *.gz eviction in _enforce_cache_limit never
+    removes it; the 30-minute TTL below governs refresh instead.
+    """
+    return get_config().ensure_mrt_cache_dir() / "bgptools-table.jsonl"
 
 
 def _download_bgptools_table(path: Path) -> None:
     """Download bgp.tools/table.jsonl to a local cache file (atomic replace)."""
     tmp = path.with_suffix(".tmp")
     try:
-        with httpx.Client(timeout=120, headers=BGP_TOOLS_HEADERS) as client:
-            with client.stream("GET", f"{BGP_TOOLS_BASE}/table.jsonl") as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
-                        f.write(chunk)
+        with get_http_client().stream(
+            "GET", f"{BGP_TOOLS_BASE}/table.jsonl", timeout=DOWNLOAD_TIMEOUT
+        ) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                    f.write(chunk)
         tmp.replace(path)
     finally:
         if tmp.exists():
@@ -444,19 +515,19 @@ def _bgptools_route_lookup(prefix: str) -> BGPRouteLookupResult:
     try:
         path = _bgptools_table_path()
         fresh = (
-            path.exists()
-            and (time.time() - path.stat().st_mtime) < _BGPTOOLS_TABLE_TTL
+            path.exists() and (time.time() - path.stat().st_mtime) < _BGPTOOLS_TABLE_TTL
         )
         if not fresh:
             try:
                 _download_bgptools_table(path)
-            except Exception:
+            except Exception as exc:
                 # Fall back to a stale cached copy if the refetch failed.
+                logger.warning("bgp.tools table download failed: %s", exc)
                 if not path.exists():
                     raise
 
         routes = []
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -475,7 +546,7 @@ def _bgptools_route_lookup(prefix: str) -> BGPRouteLookupResult:
                             collector="bgp.tools",
                         )
                     )
-                    if len(routes) >= 20:
+                    if len(routes) >= _ROUTE_CAP:
                         break
 
         return BGPRouteLookupResult(
@@ -484,9 +555,14 @@ def _bgptools_route_lookup(prefix: str) -> BGPRouteLookupResult:
             total=len(routes),
             source="bgp.tools table",
         )
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("bgp.tools table lookup failed for %s: %s", prefix, exc)
         return BGPRouteLookupResult(
-            prefix=prefix, routes=[], total=0, source=f"bgp.tools error: {e}"
+            prefix=prefix,
+            routes=[],
+            total=0,
+            source="bgp.tools table",
+            error=f"bgp.tools lookup failed: {exc}",
         )
 
 
@@ -504,12 +580,8 @@ def _bgptools_load_asn_cache() -> dict[int, str]:
         return _bgptools_asn_cache
 
     try:
-        import csv
-        import io
-
-        with httpx.Client(timeout=30, headers=BGP_TOOLS_HEADERS) as client:
-            resp = client.get(f"{BGP_TOOLS_BASE}/asns.csv")
-            resp.raise_for_status()
+        resp = get_http_client().get(f"{BGP_TOOLS_BASE}/asns.csv", timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
 
         cache = {}
         reader = csv.DictReader(io.StringIO(resp.text))
@@ -520,10 +592,11 @@ def _bgptools_load_asn_cache() -> dict[int, str]:
 
         _bgptools_asn_cache = cache
         return cache
-    except Exception:
+    except Exception as exc:
         # Don't poison the cache on a transient failure — leave it unset so
         # the next lookup retries the download instead of returning empty
         # for the lifetime of the process.
+        logger.warning("bgp.tools asns.csv download failed: %s", exc)
         return {}
 
 
@@ -538,43 +611,32 @@ def _bgptools_get_as_name(asn: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _bgproutes_route_lookup(
-    prefix: str, api_key: str
-) -> BGPRouteLookupResult | None:
+def _bgproutes_route_lookup(prefix: str, api_key: str) -> BGPRouteLookupResult | None:
     """Look up routes via bgproutes.io RIB endpoint.
 
     Returns routes with RPKI ROV and ASPA validation status per entry.
     Requires BGPROUTES_API_KEY environment variable.
     """
     try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        with httpx.Client(timeout=HTTP_TIMEOUT, headers=headers) as client:
-            resp = client.get(
-                f"{BGPROUTES_API_BASE}/rib",
-                params={"prefix_exact_match": prefix},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        resp = get_http_client().get(
+            f"{BGPROUTES_API_BASE}/rib",
+            params={"prefix_exact_match": prefix},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         entries = data.get("data", data) if isinstance(data, dict) else data
         if not isinstance(entries, list):
             entries = [entries] if entries else []
 
         routes = []
-        for entry in entries[:20]:
-            as_path_raw = entry.get("aspath", entry.get("as_path", ""))
-            if isinstance(as_path_raw, str):
-                as_path = [int(a) for a in as_path_raw.split() if a.isdigit()]
-            else:
-                as_path = [int(a) for a in as_path_raw]
-
-            communities_raw = entry.get("communities", entry.get("community", ""))
-            if isinstance(communities_raw, str):
-                communities = [c.strip() for c in communities_raw.split(",") if c.strip()]
-            elif isinstance(communities_raw, list):
-                communities = [str(c) for c in communities_raw]
-            else:
-                communities = []
+        for entry in entries[:_ROUTE_CAP]:
+            as_path = _parse_as_path(entry.get("aspath", entry.get("as_path")))
+            communities = _parse_communities(
+                entry.get("communities", entry.get("community"))
+            )
 
             origin_asn = as_path[-1] if as_path else entry.get("origin_asn", 0)
 
@@ -600,21 +662,22 @@ def _bgproutes_route_lookup(
             total=len(routes),
             source="bgproutes.io (includes RPKI ROV + ASPA validation)",
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("bgproutes.io RIB lookup failed for %s: %s", prefix, exc)
         return None
 
 
 def _bgproutes_get_topology(api_key: str, asn: int) -> list[int] | None:
     """Get upstream ASNs via bgproutes.io topology endpoint."""
     try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        with httpx.Client(timeout=HTTP_TIMEOUT, headers=headers) as client:
-            resp = client.get(
-                f"{BGPROUTES_API_BASE}/topology",
-                params={"asn": asn},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        resp = get_http_client().get(
+            f"{BGPROUTES_API_BASE}/topology",
+            params={"asn": asn},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         entries = data.get("data", data) if isinstance(data, dict) else data
         if not isinstance(entries, list):
@@ -627,7 +690,8 @@ def _bgproutes_get_topology(api_key: str, asn: int) -> list[int] | None:
                 upstreams.add(int(provider))
 
         return sorted(upstreams) if upstreams else None
-    except Exception:
+    except Exception as exc:
+        logger.warning("bgproutes.io topology failed for AS%s: %s", asn, exc)
         return None
 
 
@@ -648,7 +712,7 @@ def _cloudflare_route_lookup(prefix: str) -> BGPRouteLookupResult | None:
         return None
 
     routes = []
-    for r in raw_routes[:20]:
+    for r in raw_routes[:_ROUTE_CAP]:
         as_path = r.get("as_path", [])
         origin_asn = as_path[-1] if as_path else 0
         routes.append(
@@ -712,13 +776,11 @@ def _cloudflare_hijacks(
 
     data = cloudflare_get("radar/bgp/hijacks/events", params=params)
     if not data or not data.get("success"):
-        if not get_config().cloudflare_api_token:
-            return BGPHijackResult(
-                events=[], total=0,
-                source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
-            )
         return BGPHijackResult(
-            events=[], total=0, source="Cloudflare Radar API error",
+            events=[],
+            total=0,
+            source="Cloudflare Radar",
+            error=cloudflare_unavailable_reason(),
         )
 
     result = data.get("result", {})
@@ -749,7 +811,9 @@ def _cloudflare_hijacks(
 
     total = data.get("result_info", {}).get("total_count", len(events))
     return BGPHijackResult(
-        events=events, total=total, source="Cloudflare Radar",
+        events=events,
+        total=total,
+        source="Cloudflare Radar",
     )
 
 
@@ -774,13 +838,11 @@ def _cloudflare_leaks(
 
     data = cloudflare_get("radar/bgp/leaks/events", params=params)
     if not data or not data.get("success"):
-        if not get_config().cloudflare_api_token:
-            return BGPLeakResult(
-                events=[], total=0,
-                source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
-            )
         return BGPLeakResult(
-            events=[], total=0, source="Cloudflare Radar API error",
+            events=[],
+            total=0,
+            source="Cloudflare Radar",
+            error=cloudflare_unavailable_reason(),
         )
 
     result = data.get("result", {})
@@ -804,7 +866,9 @@ def _cloudflare_leaks(
 
     total = data.get("result_info", {}).get("total_count", len(events))
     return BGPLeakResult(
-        events=events, total=total, source="Cloudflare Radar",
+        events=events,
+        total=total,
+        source="Cloudflare Radar",
     )
 
 
@@ -814,11 +878,30 @@ def _cloudflare_leaks(
 
 # Region keywords mapped to collector locations for filtering
 _REGION_KEYWORDS = {
-    "europe": ["netherlands", "united kingdom", "france", "germany", "switzerland",
-               "austria", "sweden", "italy", "spain", "russian", "romania", "bucharest"],
+    "europe": [
+        "netherlands",
+        "united kingdom",
+        "france",
+        "germany",
+        "switzerland",
+        "austria",
+        "sweden",
+        "italy",
+        "spain",
+        "russian",
+        "romania",
+        "bucharest",
+    ],
     "asia": ["japan", "tokyo", "singapore", "dubai", "uae"],
     "us": ["california", "new york", "miami", "florida", "palo alto", "san jose"],
-    "north america": ["california", "new york", "miami", "florida", "palo alto", "san jose"],
+    "north america": [
+        "california",
+        "new york",
+        "miami",
+        "florida",
+        "palo alto",
+        "san jose",
+    ],
     "south america": ["brazil", "sao paulo", "uruguay", "montevideo"],
     "africa": ["south africa", "johannesburg"],
     "middle east": ["dubai", "uae"],
@@ -832,10 +915,13 @@ def _get_ris_collectors(
     """Fetch RIPE RIS route collector metadata."""
     try:
         data = ripestat_get("rrc-info/data.json").get("data", {})
-    except Exception:
+    except Exception as exc:
+        logger.warning("RIPEstat rrc-info failed: %s", exc)
         return RouteCollectorResult(
-            collectors=[], total=0, active=0,
-            tip="Failed to fetch collector data from RIPEstat.",
+            collectors=[],
+            total=0,
+            active=0,
+            error=f"Failed to fetch collector data from RIPEstat: {exc}",
         )
 
     collectors = []
@@ -891,25 +977,29 @@ def _get_ris_collectors(
     )
 
 
+def _broker_query(
+    time_start: str, time_end: str, data_type: str, collector: str
+) -> list:
+    """Query the BGPKIT Broker for MRT files. Raises on broker failure."""
+    import bgpkit  # native extension; imported lazily to keep server start fast
+
+    return bgpkit.Broker().query(
+        ts_start=time_start,
+        ts_end=time_end,
+        data_type=data_type,
+        collector_id=collector.lower(),
+    )
+
+
 def _mrt_search(
     time_start: str, time_end: str, data_type: str, collector: str | None
 ) -> MRTSearchResult:
     """Find MRT files via BGPKIT Broker."""
-    import bgpkit
-
-    collector = collector or "rrc00"
-    data_type = data_type.lower()
-    if data_type not in ("rib", "update"):
-        data_type = "rib"
+    collector = collector or get_config().default_collector
+    data_type = _normalize_data_type(data_type)
 
     try:
-        broker = bgpkit.Broker()
-        items = broker.query(
-            ts_start=time_start,
-            ts_end=time_end,
-            data_type=data_type,
-            collector_id=collector.lower(),
-        )
+        items = _broker_query(time_start, time_end, data_type, collector)
 
         files = []
         for item in items:
@@ -961,7 +1051,8 @@ def _mrt_search(
             total=total_files,
             tip=tip,
         )
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("BGPKIT broker query failed: %s", exc)
         return MRTSearchResult(
             query_start=time_start,
             query_end=time_end,
@@ -969,7 +1060,7 @@ def _mrt_search(
             data_type=data_type,
             files=[],
             total=0,
-            tip=f"Error searching MRT files: {e}",
+            error=f"MRT file search failed: {exc}",
         )
 
 
@@ -986,25 +1077,16 @@ def _bgp_historical_lookup(
     Files are cached in the configured mrt_cache_dir. If the file already
     exists locally, it is reused without re-downloading.
     """
-    import bgpkit
-    from datetime import datetime, timezone
+    import bgpkit  # native extension; imported lazily to keep server start fast
 
     cfg = get_config()
     cache_dir = cfg.ensure_mrt_cache_dir()
 
     collector = collector or cfg.default_collector
-    data_type = data_type.lower()
-    if data_type not in ("rib", "update"):
-        data_type = "rib"
+    data_type = _normalize_data_type(data_type)
 
     try:
-        broker = bgpkit.Broker()
-        items = broker.query(
-            ts_start=time_start,
-            ts_end=time_end,
-            data_type=data_type,
-            collector_id=collector.lower(),
-        )
+        items = _broker_query(time_start, time_end, data_type, collector)
 
         if not items:
             return HistoricalBGPResult(
@@ -1015,8 +1097,9 @@ def _bgp_historical_lookup(
                 data_type=data_type,
                 entries=[],
                 total=0,
-                mrt_file="none",
-                source=f"No MRT files found for {collector} between {time_start} and {time_end}",
+                mrt_file="",
+                source=f"RIPE RIS MRT archive ({collector})",
+                error=f"No MRT files found for {collector} between {time_start} and {time_end}",
             )
 
         # For RIB: use the closest dump. For updates: parse all files in range.
@@ -1052,13 +1135,17 @@ def _bgp_historical_lookup(
                 origin_asns = elem.origin_asns or []
                 origin_asn = origin_asns[0] if origin_asns else 0
 
-                as_path_str = elem.as_path or ""
-                as_path = [int(a) for a in as_path_str.split() if a.isdigit()]
-
+                as_path = _parse_as_path(elem.as_path)
                 communities = elem.communities or []
 
                 ts = elem.timestamp
-                ts_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") if ts else ""
+                ts_str = (
+                    datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S"
+                    )
+                    if ts
+                    else ""
+                )
 
                 entries.append(
                     HistoricalBGPEntry(
@@ -1081,7 +1168,9 @@ def _bgp_historical_lookup(
             if len(entries) >= max_results:
                 break
 
-        file_urls = parsed_url if len(files_to_parse) == 1 else f"{len(files_to_parse)} files"
+        file_urls = (
+            parsed_url if len(files_to_parse) == 1 else f"{len(files_to_parse)} files"
+        )
 
         return HistoricalBGPResult(
             prefix=prefix,
@@ -1094,17 +1183,18 @@ def _bgp_historical_lookup(
             mrt_file=file_urls,
             source=f"RIPE RIS MRT archive ({collector})",
         )
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("MRT lookup failed for %s: %s", prefix, exc)
         return HistoricalBGPResult(
             prefix=prefix,
             time_start=time_start,
             time_end=time_end,
-            collector=collector or "rrc00",
+            collector=collector,
             data_type=data_type,
             entries=[],
             total=0,
-            mrt_file="error",
-            source=f"MRT parsing error: {e}",
+            source=f"RIPE RIS MRT archive ({collector})",
+            error=f"MRT download/parse failed: {exc}",
         )
 
 
@@ -1115,8 +1205,6 @@ def _cached_mrt_path(cache_dir: Path, url: str) -> Path:
       https://data.ris.ripe.net/rrc00/2026.03/bview.20260322.0000.gz
       → <cache_dir>/rrc00/2026.03/bview.20260322.0000.gz
     """
-    from urllib.parse import urlparse
-
     parsed = urlparse(url)
     # path: /rrc00/2026.03/bview.20260322.0000.gz
     rel = parsed.path.lstrip("/")
@@ -1128,19 +1216,23 @@ def _download_mrt(url: str, cache_dir: Path) -> Path | None:
     local_path = _cached_mrt_path(cache_dir, url)
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Stream to a temp file and rename atomically: tools run concurrently in a
+    # thread pool, so another lookup must never parse a half-written file.
+    tmp = local_path.with_suffix(local_path.suffix + ".part")
     try:
-        with httpx.Client(timeout=120) as client:
-            with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                with open(local_path, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
-                        f.write(chunk)
+        with get_http_client().stream("GET", url, timeout=DOWNLOAD_TIMEOUT) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                    f.write(chunk)
+        tmp.replace(local_path)
         return local_path
-    except Exception:
-        # Clean up partial download
-        if local_path.exists():
-            local_path.unlink()
+    except Exception as exc:
+        logger.warning("MRT download failed for %s: %s", url, exc)
         return None
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _enforce_cache_limit(
@@ -1186,18 +1278,13 @@ def _ripestat_route_lookup(
                 continue
 
             for peer in rrc.get("peers", []):
-                as_path_str = peer.get("as_path", "")
-                as_path = [int(a) for a in as_path_str.split() if a.isdigit()]
+                as_path = _parse_as_path(peer.get("as_path"))
                 origin_asn = as_path[-1] if as_path else 0
                 # The peer ASN is the collector's direct neighbour — the first
                 # hop of the AS path — not the route's origin (which is the
                 # last hop). RIPEstat's `asn_origin` field is the origin AS.
                 peer_asn = as_path[0] if as_path else int(peer.get("peer_asn", 0))
-                community = peer.get("community", "")
-                if isinstance(community, str):
-                    communities = [c.strip() for c in community.split(",") if c.strip()]
-                else:
-                    communities = [str(c) for c in community]
+                communities = _parse_communities(peer.get("community"))
                 routes.append(
                     BGPRoute(
                         prefix=peer.get("prefix", prefix),
@@ -1217,13 +1304,18 @@ def _ripestat_route_lookup(
 
         return BGPRouteLookupResult(
             prefix=prefix,
-            routes=routes[:20],
+            routes=routes[:_ROUTE_CAP],
             total=len(routes),
             source=source,
         )
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("RIPEstat looking-glass failed for %s: %s", prefix, exc)
         return BGPRouteLookupResult(
-            prefix=prefix, routes=[], total=0, source=f"RIPEstat error: {e}"
+            prefix=prefix,
+            routes=[],
+            total=0,
+            source="RIPEstat Looking Glass",
+            error=f"RIPEstat lookup failed: {exc}",
         )
 
 
@@ -1236,22 +1328,30 @@ def _get_as_name(asn: int) -> str | None:
     """Look up AS name. Tries RIPEstat first, then bgp.tools CSV cache."""
     # 1. RIPEstat
     try:
-        name = ripestat_get(
-            "as-overview/data.json",
-            params={"resource": f"AS{asn}"},
-            timeout=10,
-        ).get("data", {}).get("holder")
+        name = (
+            ripestat_get(
+                "as-overview/data.json",
+                params={"resource": f"AS{asn}"},
+                timeout=10,
+            )
+            .get("data", {})
+            .get("holder")
+        )
         if name:
             return name
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("RIPEstat as-overview failed for AS%s: %s", asn, exc)
 
     # 2. bgp.tools asns.csv (cached in-memory)
     return _bgptools_get_as_name(asn)
 
 
-def _get_announced_prefixes(asn: int) -> tuple[list[str], list[str]]:
-    """Get prefixes announced by an ASN via RIPEstat."""
+def _get_announced_prefixes(asn: int) -> tuple[list[str], list[str], str | None]:
+    """Get prefixes announced by an ASN via RIPEstat.
+
+    Returns (v4, v6, error). `error` is set when RIPEstat failed, so callers
+    can tell "announces nothing" from "could not check".
+    """
     try:
         data = ripestat_get(
             "announced-prefixes/data.json",
@@ -1266,9 +1366,10 @@ def _get_announced_prefixes(asn: int) -> tuple[list[str], list[str]]:
                 v6.append(pfx)
             elif pfx:
                 v4.append(pfx)
-        return _sort_prefixes(v4), _sort_prefixes(v6)
-    except Exception:
-        return [], []
+        return _sort_prefixes(v4), _sort_prefixes(v6), None
+    except Exception as exc:
+        logger.warning("RIPEstat announced-prefixes failed for AS%s: %s", asn, exc)
+        return [], [], f"RIPEstat announced-prefixes lookup failed: {exc}"
 
 
 def _sort_prefixes(prefixes: list[str]) -> list[str]:
@@ -1277,7 +1378,6 @@ def _sort_prefixes(prefixes: list[str]) -> list[str]:
     Lexicographic sort places '100.0.0.0/8' before '11.0.0.0/8'; numeric sort
     keeps the order sensible, which matters when the list is later truncated.
     """
-    import ipaddress
 
     def key(p: str):
         try:
@@ -1304,8 +1404,8 @@ def _get_upstreams(asn: int) -> list[int]:
                 upstreams.append(neighbour.get("asn", 0))
         if upstreams:
             return sorted(upstreams)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("RIPEstat asn-neighbours failed for AS%s: %s", asn, exc)
 
     # 2. bgproutes.io topology (requires API key)
     api_key = _get_bgproutes_key()

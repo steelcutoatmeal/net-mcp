@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,5 +9,18 @@ build/
 *.egg
 .venv/
 .env
+
+# Tooling caches
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+
+# Local configuration (may contain API tokens) — copy config.example.toml instead
+config.toml
+
+# Claude Code personal overrides
+.claude/settings.local.json
+CLAUDE.local.md
+
+# OS
+.DS_Store

@@ -141,14 +141,24 @@ All RIPEstat requests include `sourceapp=net-mcp` per their API guidelines.
 
 ### With Claude Code
 
-Add to your MCP server configuration (`~/.claude/settings.json` or project `.claude/settings.json`):
+Sessions opened inside this repository pick up the server automatically from the checked-in `.mcp.json`. To use it from any other project, register it once at user scope:
+
+```bash
+claude mcp add --scope user --transport stdio net-mcp -- \
+  uv run --directory /path/to/net-mcp net-mcp
+```
+
+API tokens are read from your environment (`CLOUDFLARE_API_TOKEN`, `BGPROUTES_API_KEY`) or from `config.toml`; see Configuration.
+
+### Claude Desktop and other MCP clients
 
 ```json
 {
   "mcpServers": {
     "net-mcp": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/net-mcp", "net-mcp"]
+      "args": ["run", "--directory", "/path/to/net-mcp", "net-mcp"],
+      "env": { "CLOUDFLARE_API_TOKEN": "your-token" }
     }
   }
 }
@@ -174,6 +184,12 @@ Config file is searched at:
 2. `./config.toml` (next to pyproject.toml)
 3. `~/.config/net-mcp/config.toml`
 
+`config.toml` is gitignored because it may hold API tokens. Start from the template:
+
+```bash
+cp config.example.toml config.toml
+```
+
 ### config.toml
 
 ```toml
@@ -186,6 +202,9 @@ mrt_cache_dir = "/path/to/mrt/cache"
 mrt_max_cache_gb = 10
 
 [api]
+# Cloudflare Radar API token (or set CLOUDFLARE_API_TOKEN env var)
+cloudflare_api_token = "your-token-here"
+
 # bgproutes.io API key (or set BGPROUTES_API_KEY env var)
 bgproutes_api_key = "your-key-here"
 
@@ -225,14 +244,22 @@ Historical BGP lookups download MRT files from the RIPE RIS archive. These files
 
 Downloaded files are cached at `<mrt_cache_dir>/<collector>/<year.month>/<filename>.gz` and reused on subsequent queries. The cache is automatically pruned when it exceeds `mrt_max_cache_gb`.
 
+## Error reporting
+
+Every API-backed result carries an `error` field. It is `null` when the source answered, and set to a short message when the lookup failed, so an empty `routes`/`origins`/`roas` list with `error: null` means "genuinely nothing there", not "the API was down". Invalid input (bad prefix, unknown record type, out-of-range port) is rejected with a tool error that explains the valid form. Local diagnostic tools report failures in `CommandResult.error`.
+
 ## Development
 
 ```bash
-git clone <repo>
+git clone https://github.com/steelcutoatmeal/net-mcp.git
 cd net-mcp
 uv sync --group dev
-uv run pytest
+uv run pytest -q                 # offline, ~1s
+uv run ruff check src tests      # lint (CI enforces)
+uv run ruff format src tests     # format
 ```
+
+Tests never touch the network: they monkeypatch the HTTP helpers on each tool module and call tools in-process via `mcp.call_tool`. CI runs lint, format check, and tests on Python 3.10, 3.12, and 3.14.
 
 ## License
 

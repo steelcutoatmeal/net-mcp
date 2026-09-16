@@ -1,72 +1,70 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## What This Is
-
-net-mcp is a FastMCP server (39 tools) that gives LLMs structured access to network engineering data: BGP routing, RPKI/ASPA validation, DNS/DNSSEC, IRR, PeeringDB, IP math, and local diagnostics.
+net-mcp is a FastMCP server that gives LLMs structured access to network engineering data: BGP, RPKI/ASPA, DNS/DNSSEC, IRR, PeeringDB, IP math, and local diagnostics.
 
 ## Commands
 
 ```bash
-uv sync                  # Install dependencies
-uv sync --group dev      # Install with test dependencies
-uv run net-mcp           # Run the MCP server
-uv run pytest            # Run tests (pytest-asyncio, auto mode)
+uv sync --group dev       # install (dev group includes pytest + ruff)
+uv run pytest -q          # tests are fully offline; ~1s
+uv run ruff check src tests && uv run ruff format src tests
+uv run net-mcp            # run the server on stdio
 ```
 
-Test tools interactively:
+Poke a tool in-process (this is also how the tests call tools):
+
 ```python
 import asyncio
 from net_mcp.server import mcp
 
 async def main():
-    tools = await mcp.list_tools()
-    result = await mcp.call_tool('tool_name', {'param': 'value'})
-    print(result.structured_content)
+    res = await mcp.call_tool("bgp_prefix_origin", {"prefix": "1.1.1.0/24"})
+    print(res.structured_content)
 
 asyncio.run(main())
 ```
 
+`.mcp.json` registers the server for Claude Code sessions opened in this repo.
+
 ## Architecture
 
-**Entry point:** `src/net_mcp/server.py` — creates `FastMCP("net-mcp")`, calls `register_*_tools(mcp)` from each tool module, exposes `main()`.
+- `server.py` creates `FastMCP("net-mcp")` and calls each module's `register_<domain>_tools(mcp)`. Register a new module there.
+- `tools/<domain>.py` defines tools inside that register function with `@mcp.tool(tags={...})`; private helpers are `_`-prefixed and live at module level so tests can monkeypatch them.
+- `models.py` holds the DNS/RPKI/BGP result models. IRR, PeeringDB, iptools, and local keep their models in their own module. Both are fine; do not move them for consistency's sake.
+- `__init__.py` holds the shared HTTP layer: `get_http_client()` (one pooled `httpx.Client`, sets `User-Agent`), `ripestat_get()`, `cloudflare_get()`, `cloudflare_unavailable_reason()`.
+- `config.py` is a singleton via `get_config()`. Precedence: `NET_MCP_*` env vars, then `config.toml`, then defaults. `config.toml` is gitignored (it may hold API tokens); `config.example.toml` is the documented template.
 
-**Tool modules** (`src/net_mcp/tools/`): Each module exports one `register_<domain>_tools(mcp: FastMCP)` function. Inside, tools are defined with `@mcp.tool(tags={...})` decorators. Private helper functions are prefixed with `_`. Seven modules: `bgp.py`, `dns.py`, `rpki.py`, `irr.py`, `peeringdb.py`, `iptools.py`, `local.py`.
+## Conventions you cannot infer from one file
 
-**Models** (`src/net_mcp/models.py`): All Pydantic `BaseModel` classes for tool inputs/outputs. Every tool returns a model. Parameters use `Annotated[type, Field(description="...")]`.
+**Tools are sync `def` on purpose.** FastMCP runs sync tools in a thread pool, so blocking `httpx`, `socket`, `subprocess`, dnspython, and `bgpkit` calls are correct. Do not make a tool `async def` unless every I/O call inside it is also async, or it will block the whole server.
 
-**Shared API helpers** (`src/net_mcp/__init__.py`):
-- `ripestat_get(path, params)` — adds `sourceapp=net-mcp` to all RIPEstat requests
-- `cloudflare_get(path, params)` — adds Bearer token, returns `None` if no token configured (callers must handle graceful fallback)
+**Error contract.** Never let an upstream failure look like an empty result.
+- Upstream API/network failure: return the normal model with `error` set (every API-backed result model has `error: str | None`). Keep `source` as the source name, never an error string.
+- Invalid input: `raise ToolError("what valid input looks like")` from `fastmcp.exceptions`.
+- `local.py` tools return `CommandResult(success=False, error=...)` for both cases.
+- Every fallback `except` logs via the module `logger` (`logging.getLogger(__name__)`). Logging goes to stderr; stdout is the MCP transport.
 
-**Config** (`src/net_mcp/config.py`): Singleton via `get_config()`. Loads from env vars (`NET_MCP_*`) → `config.toml` → defaults. Key settings: `mrt_cache_dir`, `cloudflare_api_token`, `bgproutes_api_key`, `default_collector`, `default_dns_resolver`, `allow_active_local_tools` (gates `local_nmap`/`local_curl`, off by default).
+**HTTP helper asymmetry.** `ripestat_get()` raises on failure; `cloudflare_get()` returns `None` when no token is configured or the request fails. Wrap RIPEstat calls in try/except inside fallback chains; test Cloudflare results for `None`.
 
-## Data Source Priority Pattern
+**Data source order is per tool, and the tool docstring must state it.** The usual order is RIPEstat, then Cloudflare Radar (token), then bgproutes.io (key), then bgp.tools. Exceptions: `bgp_prefix_origin` queries Cloudflare first (it carries RPKI status); the bgp.tools full table is only fetched when RIPEstat itself failed, not when the prefix is simply unrouted; ASPA and hijack/leak tools are Cloudflare-only.
 
-Tools query multiple APIs with fallback chains. The standard order is:
+**Output caps.** Any list that can be large is capped (`_ROUTE_CAP`, `_ASN_PREFIX_CAP`, `_MRT_FILE_CAP`, `_ASPA_OBJECT_CAP`, IRR 200 objects) and the model reports the true count in `total` and explains truncation in `note` or `tip`. Keep that pattern for new tools and mention the cap in the docstring.
 
-1. **RIPEstat** — free, no key, always available
-2. **Cloudflare Radar** — free with token, returns `None` from `cloudflare_get()` if unconfigured
-3. **bgproutes.io** — requires API key, checked via `get_config().bgproutes_api_key`
-4. **bgp.tools** — last resort (ASN name cache via `asns.csv`, full table via `table.jsonl`)
+**Docstrings and `Field(description=...)` are the LLM's only documentation.** Every tool parameter and every model field needs a description. Tool docstrings say what the tool returns, when to use it over a sibling tool, which sources it uses in what order, and any cap.
 
-When adding a new data source: try it, check for `None`/empty result, fall through to next source. Never raise on API failure in a fallback chain.
+**`local.py` security rules.** `subprocess.run()` with a list argv and a timeout, never `shell=True`. Every user-supplied host, name, target, URL, or port spec goes through a validator (`_validate_host`, `_validate_nmap_target`, `_validate_port_spec`, or the dig/curl-specific ones) before it touches argv; a leading `-` is always rejected so input can never become a flag. Validators raise `ValueError` internally and the tool converts that to `CommandResult(success=False, returncode=2, error=...)`. `local_nmap` and `local_curl` stay behind `allow_active_local_tools` (off by default); they deliberately do not block private or metadata addresses, and the docstring says so.
 
-## Adding a New Tool
+**IRR uses raw whois over TCP 43**, not HTTP; queries are validated (no CR/LF, no leading `-`) and responses are size-capped.
 
-1. Create or edit a module in `src/net_mcp/tools/`
-2. Define return model in `models.py` (or inline if module-specific)
-3. Add tool inside the `register_*_tools(mcp)` function with `@mcp.tool(tags={...})`
-4. All parameters must use `Annotated[type, Field(description="...")]`
-5. Tool docstrings are sent to the LLM — explain what it does, which data sources it queries, and when to use it
-6. Register in `server.py` if it's a new module
+**bgp.tools etiquette.** `asns.csv` is cached in memory for the process lifetime and `table.jsonl` on disk with a 30-minute TTL; do not add call paths that fetch either more often.
 
-## Key Conventions
+**MRT cache.** Files land under `mrt_cache_dir/<collector>/<yyyy.mm>/`, are written atomically (`.part` then rename) because tools run concurrently, and are evicted oldest-first past `mrt_max_cache_gb`.
 
-- `bgp.py` is the largest module (1200+ lines) — contains live lookups, collector metadata, historical MRT parsing, hijack/leak detection, and all backend functions for RIPEstat/Cloudflare/bgproutes/bgp.tools
-- IRR tools use raw TCP socket whois queries (port 43), not HTTP
-- PeeringDB uses HTTP REST API at `peeringdb.com/api/`
-- `local.py` tools run subprocess commands — always use `subprocess.run()` with list args (never `shell=True`), validate inputs with `_validate_host()`, and return `CommandResult` model
-- MRT files are cached to `config.mrt_cache_dir` with automatic eviction at `mrt_max_cache_gb`
-- The `_bgptools_asn_cache` in `bgp.py` is a module-level dict loaded once from `bgp.tools/asns.csv` (~120k entries)
+## Adding a tool
+
+1. Define the result model (with descriptions and `error` if API-backed).
+2. Add the tool inside `register_<domain>_tools` with `@mcp.tool(tags={...})`, `Annotated[..., Field(description=...)]` params, and a docstring per the rules above.
+3. Put backend calls in `_`-prefixed module-level helpers so tests can monkeypatch them.
+4. Add an offline test in `tests/test_<domain>.py`: monkeypatch `ripestat_get`/`cloudflare_get`/the helper on the tool module (they are imported by name, so patch `net_mcp.tools.<domain>.ripestat_get`), then `await mcp.call_tool(...)` and assert on `structured_content`.
+5. `tests/test_server.py` will fail if the tool lacks tags, a description, an output schema, or a parameter description.
+6. Run `uv run ruff check --fix` and `uv run ruff format` before committing; CI runs both plus pytest on 3.10/3.12/3.14.

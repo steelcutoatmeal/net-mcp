@@ -10,8 +10,8 @@ import itertools
 from typing import Annotated
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
-
 
 # ---------------------------------------------------------------------------
 # Bogon / reserved prefix lists (from IANA + RFCs)
@@ -60,7 +60,7 @@ _BOGON_NETS_V6 = [(ipaddress.ip_network(p), desc) for p, desc in _BOGON_V6]
 
 # JSON numbers above 2^53 lose precision in JS-based clients. Emit such counts
 # (common for IPv6 ranges) as exact decimal strings instead.
-_JS_SAFE_INT_MAX = 2 ** 53
+_JS_SAFE_INT_MAX = 2**53
 
 
 def _count(n: int) -> int | str:
@@ -115,7 +115,10 @@ class OverlapResult(BaseModel):
     prefix_b: str
     overlaps: bool
     relationship: str = Field(
-        description="'disjoint', 'a_contains_b', 'b_contains_a', or 'equal'"
+        description=(
+            "'disjoint', 'a_contains_b', 'b_contains_a', 'equal', or "
+            "'partial_overlap' (only possible for differing IP versions or malformed input)"
+        )
     )
 
 
@@ -129,7 +132,9 @@ class SupernetResult(BaseModel):
 class BogonCheckResult(BaseModel):
     query: str
     is_bogon: bool
-    matches: list[str] = Field(description="Matching reserved ranges with RFC references")
+    matches: list[str] = Field(
+        description="Matching reserved ranges with RFC references"
+    )
     detail: str
 
 
@@ -144,7 +149,9 @@ def register_iptools(mcp: FastMCP) -> None:
     def subnet_info(
         prefix: Annotated[
             str,
-            Field(description="IP prefix in CIDR (e.g. '10.0.0.0/24') or single IP (e.g. '1.1.1.1')"),
+            Field(
+                description="IP prefix in CIDR (e.g. '10.0.0.0/24') or single IP (e.g. '1.1.1.1')"
+            ),
         ],
     ) -> SubnetInfo:
         """Get detailed information about an IP prefix or address.
@@ -162,7 +169,11 @@ def register_iptools(mcp: FastMCP) -> None:
             net = ipaddress.ip_network(f"{addr}/{pfx_len}")
 
         if net.version == 4:
-            usable = max(0, net.num_addresses - 2) if net.prefixlen < 31 else net.num_addresses
+            usable = (
+                max(0, net.num_addresses - 2)
+                if net.prefixlen < 31
+                else net.num_addresses
+            )
         else:
             usable = net.num_addresses
 
@@ -185,10 +196,14 @@ def register_iptools(mcp: FastMCP) -> None:
 
     @mcp.tool(tags={"ip", "subnet"})
     def subnet_split(
-        prefix: Annotated[str, Field(description="IP prefix to split (e.g. '10.0.0.0/24')")],
+        prefix: Annotated[
+            str, Field(description="IP prefix to split (e.g. '10.0.0.0/24')")
+        ],
         new_prefix_length: Annotated[
             int,
-            Field(description="New prefix length for subnets (must be longer than current)"),
+            Field(
+                description="New prefix length for subnets (must be longer than current)"
+            ),
         ],
     ) -> SubnetSplitResult:
         """Split an IP prefix into smaller subnets.
@@ -198,14 +213,16 @@ def register_iptools(mcp: FastMCP) -> None:
         """
         net = ipaddress.ip_network(prefix, strict=False)
         if new_prefix_length <= net.prefixlen:
-            raise ValueError(
+            raise ToolError(
                 f"New prefix length ({new_prefix_length}) must be longer than "
                 f"current ({net.prefixlen})"
             )
 
         max_len = 32 if net.version == 4 else 128
         if new_prefix_length > max_len:
-            raise ValueError(f"Prefix length cannot exceed {max_len} for IPv{net.version}")
+            raise ToolError(
+                f"Prefix length cannot exceed {max_len} for IPv{net.version}"
+            )
 
         # Compute the count arithmetically and only materialize the first 256
         # subnets — net.subnets() is a generator, so a /8 -> /32 split (16.7M
@@ -226,8 +243,12 @@ def register_iptools(mcp: FastMCP) -> None:
 
     @mcp.tool(tags={"ip", "subnet"})
     def ip_contains(
-        network: Annotated[str, Field(description="IP network in CIDR (e.g. '10.0.0.0/8')")],
-        address: Annotated[str, Field(description="IP address or prefix to check (e.g. '10.5.5.1')")],
+        network: Annotated[
+            str, Field(description="IP network in CIDR (e.g. '10.0.0.0/8')")
+        ],
+        address: Annotated[
+            str, Field(description="IP address or prefix to check (e.g. '10.5.5.1')")
+        ],
     ) -> ContainsResult:
         """Check if an IP address or prefix is within a network.
 
@@ -268,8 +289,12 @@ def register_iptools(mcp: FastMCP) -> None:
 
     @mcp.tool(tags={"ip", "subnet"})
     def prefix_overlap(
-        prefix_a: Annotated[str, Field(description="First IP prefix (e.g. '10.0.0.0/24')")],
-        prefix_b: Annotated[str, Field(description="Second IP prefix (e.g. '10.0.0.128/25')")],
+        prefix_a: Annotated[
+            str, Field(description="First IP prefix (e.g. '10.0.0.0/24')")
+        ],
+        prefix_b: Annotated[
+            str, Field(description="Second IP prefix (e.g. '10.0.0.128/25')")
+        ],
     ) -> OverlapResult:
         """Check if two IP prefixes overlap.
 
@@ -322,10 +347,17 @@ def register_iptools(mcp: FastMCP) -> None:
         for p in prefixes.split(","):
             p = p.strip()
             if p:
-                nets.append(ipaddress.ip_network(p, strict=False))
+                try:
+                    nets.append(ipaddress.ip_network(p, strict=False))
+                except ValueError as exc:
+                    raise ToolError(f"Invalid prefix '{p}': {exc}") from exc
 
         if not nets:
-            raise ValueError("No valid prefixes provided")
+            raise ToolError("No valid prefixes provided")
+        if len({n.version for n in nets}) > 1:
+            raise ToolError(
+                "All prefixes must be the same IP version (cannot mix IPv4 and IPv6)"
+            )
 
         collapsed = list(ipaddress.collapse_addresses(nets))
 
@@ -352,7 +384,9 @@ def register_iptools(mcp: FastMCP) -> None:
     def bogon_check(
         query: Annotated[
             str,
-            Field(description="IP address or prefix to check (e.g. '192.168.1.0/24', '10.0.0.1')"),
+            Field(
+                description="IP address or prefix to check (e.g. '192.168.1.0/24', '10.0.0.1')"
+            ),
         ],
     ) -> BogonCheckResult:
         """Check if an IP address or prefix is a bogon (reserved/non-routable).
@@ -372,8 +406,8 @@ def register_iptools(mcp: FastMCP) -> None:
             net = ipaddress.ip_network(f"{addr}/{pfx_len}")
 
         bogon_list = _BOGON_NETS_V4 if net.version == 4 else _BOGON_NETS_V6
-        matches = []   # query is fully within (or equal to) a reserved range
-        partial = []   # query is an aggregate that merely straddles a reserved range
+        matches = []  # query is fully within (or equal to) a reserved range
+        partial = []  # query is an aggregate that merely straddles a reserved range
 
         for bogon_net, desc in bogon_list:
             if net.subnet_of(bogon_net):

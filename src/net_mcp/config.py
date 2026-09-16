@@ -7,7 +7,7 @@ Configuration is loaded from (in order of priority):
 
 Config file locations checked (first found wins):
   1. Path in NET_MCP_CONFIG env var
-  2. ./config.toml (next to pyproject.toml)
+  2. ./config.toml (next to pyproject.toml; gitignored, copy config.example.toml)
   3. ~/.config/net-mcp/config.toml
 """
 
@@ -51,9 +51,7 @@ class NetMCPConfig:
 
         api = raw.get("api", {})
         self.bgproutes_api_key: str | None = (
-            os.environ.get("BGPROUTES_API_KEY")
-            or api.get("bgproutes_api_key")
-            or None
+            os.environ.get("BGPROUTES_API_KEY") or api.get("bgproutes_api_key") or None
         )
 
         self.cloudflare_api_token: str | None = (
@@ -62,15 +60,13 @@ class NetMCPConfig:
             or None
         )
 
-        self.default_collector: str = (
-            os.environ.get("NET_MCP_DEFAULT_COLLECTOR")
-            or raw.get("bgp", {}).get("default_collector", "rrc00")
-        )
+        self.default_collector: str = os.environ.get(
+            "NET_MCP_DEFAULT_COLLECTOR"
+        ) or raw.get("bgp", {}).get("default_collector", "rrc00")
 
-        self.default_dns_resolver: str = (
-            os.environ.get("NET_MCP_DNS_RESOLVER")
-            or raw.get("dns", {}).get("resolver", "1.1.1.1")
-        )
+        self.default_dns_resolver: str = os.environ.get(
+            "NET_MCP_DNS_RESOLVER"
+        ) or raw.get("dns", {}).get("resolver", "1.1.1.1")
 
         local = raw.get("local", {})
         self.allow_active_local_tools: bool = _as_bool(

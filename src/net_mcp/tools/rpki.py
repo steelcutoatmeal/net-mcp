@@ -1,27 +1,34 @@
 """RPKI validation, ROA lookup, and ASPA tools.
 
-Data sources (in priority order):
-  1. RIPEstat    — Free, no key. RPKI validation with ROA details.
-  2. Cloudflare  — Free with API token. RPKI status via pfx2as, ASPA data.
+Data sources:
+  - RIPEstat    — Free, no key. RPKI validation with full ROA details.
+                  Primary for rpki_validate and rpki_roa_lookup.
+  - Cloudflare  — Free with API token. RPKI status via pfx2as (used to
+                  cross-check / fall back), and the ONLY source for ASPA.
 """
 
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from net_mcp import cloudflare_get, ripestat_get
+from net_mcp import cloudflare_get, cloudflare_unavailable_reason, ripestat_get
 from net_mcp.models import (
     ROA,
-    ROALookupResult,
-    RPKIValidationResult,
     ASPAChange,
     ASPAChangesResult,
     ASPAObject,
     ASPASnapshotResult,
+    ROALookupResult,
+    RPKIValidationResult,
 )
+
+logger = logging.getLogger(__name__)
 
 HTTP_TIMEOUT = 15
 
@@ -40,8 +47,12 @@ _ASPA_OBJECT_CAP = 200
 def register_rpki_tools(mcp: FastMCP) -> None:
     @mcp.tool(tags={"rpki", "security"})
     def rpki_validate(
-        prefix: Annotated[str, Field(description="IP prefix in CIDR notation (e.g. '1.1.1.0/24')")],
-        origin_asn: Annotated[int, Field(description="Origin AS number to validate (e.g. 13335)")],
+        prefix: Annotated[
+            str, Field(description="IP prefix in CIDR notation (e.g. '1.1.1.0/24')")
+        ],
+        origin_asn: Annotated[
+            int, Field(description="Origin AS number to validate (e.g. 13335)")
+        ],
     ) -> RPKIValidationResult:
         """Validate a BGP route origin against RPKI ROAs.
 
@@ -97,11 +108,17 @@ def register_rpki_tools(mcp: FastMCP) -> None:
     ) -> ROALookupResult:
         """Look up RPKI ROAs for a prefix or ASN.
 
-        Returns all Route Origin Authorizations matching the query,
-        including max-length, trust anchor, and ASN. Useful for
-        understanding what routes an AS is authorized to originate
-        or what ROAs cover a given prefix.
+        Returns Route Origin Authorizations matching the query, including
+        max-length, trust anchor, and ASN. Useful for understanding what
+        routes an AS is authorized to originate or what ROAs cover a prefix.
+
+        For an ASN query only the first 50 announced prefixes are scanned
+        (large ASes announce thousands); `note` says when that cap applied.
+        Data source: RIPEstat. `error` is set if RIPEstat could not be reached.
         """
+        query = query.strip()
+        if query.upper().startswith("AS") and query[2:].isdigit():
+            query = query[2:]
         try:
             if "/" in query:
                 data = ripestat_get(
@@ -119,6 +136,13 @@ def register_rpki_tools(mcp: FastMCP) -> None:
                     timeout=HTTP_TIMEOUT,
                 ).get("data", {})
                 prefixes_list = pfx_data.get("prefixes", [])
+                note = ""
+                if len(prefixes_list) > _ASN_PREFIX_SCAN_CAP:
+                    note = (
+                        f"Scanned the first {_ASN_PREFIX_SCAN_CAP} of "
+                        f"{len(prefixes_list)} announced prefixes; query specific "
+                        "prefixes for the rest."
+                    )
 
                 targets = [
                     p.get("prefix", "")
@@ -127,13 +151,11 @@ def register_rpki_tools(mcp: FastMCP) -> None:
                 ]
 
                 # Run the per-prefix RPKI lookups concurrently. Done serially
-                # (the previous behaviour) this is 50 × up-to-15s requests, which
+                # (the previous behaviour) this is 50 x up-to-15s requests, which
                 # blows past any MCP client timeout; a thread pool bounds the
                 # wall-clock to a few batches.
                 all_roas: list[ROA] = []
                 if targets:
-                    from concurrent.futures import ThreadPoolExecutor
-
                     with ThreadPoolExecutor(
                         max_workers=min(_ROA_LOOKUP_WORKERS, len(targets))
                     ) as pool:
@@ -151,10 +173,15 @@ def register_rpki_tools(mcp: FastMCP) -> None:
                         seen.add(key)
                         unique_roas.append(roa)
 
-                return ROALookupResult(query=query, roas=unique_roas, total=len(unique_roas))
+                return ROALookupResult(
+                    query=query, roas=unique_roas, total=len(unique_roas), note=note
+                )
 
-        except Exception:
-            return ROALookupResult(query=query, roas=[], total=0)
+        except Exception as exc:
+            logger.warning("RIPEstat ROA lookup failed for %s: %s", query, exc)
+            return ROALookupResult(
+                query=query, roas=[], total=0, error=f"RIPEstat lookup failed: {exc}"
+            )
 
     @mcp.tool(tags={"rpki", "aspa", "security"})
     def rpki_aspa_lookup(
@@ -164,11 +191,15 @@ def register_rpki_tools(mcp: FastMCP) -> None:
         ] = None,
         role: Annotated[
             str,
-            Field(description="'customer' to find ASPA objects where ASN is the customer, 'provider' to find where ASN is listed as a provider"),
+            Field(
+                description="'customer' to find ASPA objects where ASN is the customer, 'provider' to find where ASN is listed as a provider"
+            ),
         ] = "customer",
         date: Annotated[
             str | None,
-            Field(description="Historical date in ISO 8601 (e.g. '2026-03-01'). Default is current."),
+            Field(
+                description="Historical date in ISO 8601 (e.g. '2026-03-01'). Default is current."
+            ),
         ] = None,
     ) -> ASPASnapshotResult:
         """Look up RPKI ASPA (AS Provider Authorization) objects.
@@ -181,8 +212,13 @@ def register_rpki_tools(mcp: FastMCP) -> None:
         Use 'provider' role to see which ASes have authorized a given AS
         as their provider.
 
-        Requires Cloudflare Radar API token (CLOUDFLARE_API_TOKEN).
+        At most 200 objects are returned (an unfiltered snapshot is the whole
+        dataset); `total` reports the real count. Requires a Cloudflare Radar
+        API token (CLOUDFLARE_API_TOKEN); `error` explains if it is missing.
         """
+        role = role.lower().strip()
+        if role not in ("customer", "provider"):
+            raise ToolError("role must be 'customer' or 'provider'")
         params: dict = {}
         if asn:
             if role == "provider":
@@ -195,15 +231,11 @@ def register_rpki_tools(mcp: FastMCP) -> None:
 
         data = cloudflare_get("radar/bgp/rpki/aspa/snapshot", params=params)
         if not data or not data.get("success"):
-            from net_mcp.config import get_config
-
-            if not get_config().cloudflare_api_token:
-                return ASPASnapshotResult(
-                    objects=[], total=0,
-                    source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
-                )
             return ASPASnapshotResult(
-                objects=[], total=0, source="Cloudflare Radar API error",
+                objects=[],
+                total=0,
+                source="Cloudflare Radar",
+                error=cloudflare_unavailable_reason(),
             )
 
         result = data.get("result", {})
@@ -266,15 +298,11 @@ def register_rpki_tools(mcp: FastMCP) -> None:
 
         data = cloudflare_get("radar/bgp/rpki/aspa/changes", params=params)
         if not data or not data.get("success"):
-            from net_mcp.config import get_config
-
-            if not get_config().cloudflare_api_token:
-                return ASPAChangesResult(
-                    changes=[], total=0,
-                    source="Cloudflare Radar API token not configured. Set CLOUDFLARE_API_TOKEN.",
-                )
             return ASPAChangesResult(
-                changes=[], total=0, source="Cloudflare Radar API error",
+                changes=[],
+                total=0,
+                source="Cloudflare Radar",
+                error=cloudflare_unavailable_reason(),
             )
 
         result = data.get("result", {})
@@ -331,7 +359,8 @@ def _validate_ripestat(prefix: str, origin_asn: int) -> RPKIValidationResult | N
         elif raw_status in ("unknown", "not_found", ""):
             status = "NOT_FOUND"
         else:
-            status = raw_status.upper()
+            status = "ERROR"
+            reason = f"unrecognised RIPEstat status '{raw_status}'"
 
         roas = _parse_roas(data.get("validating_roas", []))
         detail = _build_detail(status, len(roas), prefix, origin_asn, reason)
@@ -343,7 +372,8 @@ def _validate_ripestat(prefix: str, origin_asn: int) -> RPKIValidationResult | N
             matching_roas=roas,
             detail=detail,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("RIPEstat RPKI validation failed for %s: %s", prefix, exc)
         return None
 
 
@@ -384,7 +414,8 @@ def _roas_for_prefix(query: str, prefix: str) -> list[ROA]:
             timeout=_ROA_LOOKUP_TIMEOUT,
         ).get("data", {})
         return _parse_roas(d.get("validating_roas", []))
-    except Exception:
+    except Exception as exc:
+        logger.warning("RIPEstat ROA fetch failed for %s: %s", prefix, exc)
         return []
 
 
@@ -415,4 +446,5 @@ def _build_detail(
     elif status == "NOT_FOUND":
         return f"No ROAs found covering {prefix} — RPKI status is NOT_FOUND."
     else:
-        return f"Route {prefix} from AS{origin_asn} RPKI status: {status}."
+        why = reason or "validation source returned an unexpected response"
+        return f"Route {prefix} from AS{origin_asn} RPKI status: {status} — {why}."

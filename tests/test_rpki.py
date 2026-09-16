@@ -13,7 +13,9 @@ def test_build_detail_valid():
 
 
 def test_build_detail_invalid_uses_reason():
-    detail = _build_detail("INVALID", 1, "1.1.1.0/24", 9999, reason="origin ASN not authorized")
+    detail = _build_detail(
+        "INVALID", 1, "1.1.1.0/24", 9999, reason="origin ASN not authorized"
+    )
     assert "INVALID" in detail
     # The most important case must NOT claim NOT_FOUND.
     assert "NOT_FOUND" not in detail
@@ -52,7 +54,12 @@ def test_roas_for_prefix_parses(monkeypatch):
     fake = {
         "data": {
             "validating_roas": [
-                {"prefix": "1.1.1.0/24", "max_length": 24, "origin": 13335, "source": "RIPE"}
+                {
+                    "prefix": "1.1.1.0/24",
+                    "max_length": 24,
+                    "origin": 13335,
+                    "source": "RIPE",
+                }
             ]
         }
     }

@@ -1,7 +1,8 @@
-"""DNS tools with DNSSEC validation support."""
+"""DNS tools with DNSSEC validation support (dnspython, no external APIs)."""
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Annotated
 
@@ -15,10 +16,10 @@ import dns.rcode
 import dns.rdatatype
 import dns.resolver
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from net_mcp.config import get_config
-
 from net_mcp.models import (
     DelegationStep,
     DNSLookupResult,
@@ -26,6 +27,8 @@ from net_mcp.models import (
     DNSSECStatus,
     DNSTraceResult,
 )
+
+logger = logging.getLogger(__name__)
 
 VALID_RECORD_TYPES = {
     "A",
@@ -50,13 +53,23 @@ def _default_resolver() -> str:
 def register_dns_tools(mcp: FastMCP) -> None:
     @mcp.tool(tags={"dns", "dnssec"})
     def dns_lookup(
-        name: Annotated[str, Field(description="Domain name to query (e.g. 'cloudflare.com')")],
+        name: Annotated[
+            str, Field(description="Domain name to query (e.g. 'cloudflare.com')")
+        ],
         record_type: Annotated[
-            str, Field(description="DNS record type: A, AAAA, MX, NS, TXT, SOA, CNAME, PTR, SRV, CAA")
+            str,
+            Field(
+                description=(
+                    "DNS record type: A, AAAA, MX, NS, TXT, SOA, CNAME, PTR, SRV, "
+                    "CAA, DNSKEY, DS (case-insensitive)"
+                )
+            ),
         ] = "A",
         resolver: Annotated[
             str | None,
-            Field(description="DNS resolver IP to use. Defaults to the configured resolver."),
+            Field(
+                description="DNS resolver IP to use. Defaults to the configured resolver."
+            ),
         ] = None,
     ) -> DNSLookupResult:
         """Query DNS records for a domain with DNSSEC validation status.
@@ -72,7 +85,7 @@ def register_dns_tools(mcp: FastMCP) -> None:
         """
         record_type = record_type.upper()
         if record_type not in VALID_RECORD_TYPES:
-            raise ValueError(
+            raise ToolError(
                 f"Unsupported record type '{record_type}'. "
                 f"Supported: {', '.join(sorted(VALID_RECORD_TYPES))}"
             )
@@ -93,14 +106,18 @@ def register_dns_tools(mcp: FastMCP) -> None:
                 query_type=record_type,
                 resolver=resolver,
                 records=[],
-                dnssec=DNSSECStatus(enabled=False, valid=None, detail="NXDOMAIN — domain does not exist"),
+                dnssec=DNSSECStatus(
+                    enabled=False, valid=None, detail="NXDOMAIN — domain does not exist"
+                ),
                 response_time_ms=round(elapsed, 2),
             )
         except (dns.resolver.NoNameservers, dns.exception.Timeout) as exc:
             # SERVFAIL (NoNameservers) or timeout. A validating resolver
             # returns SERVFAIL when DNSSEC validation fails — diagnose it.
             elapsed = (time.monotonic() - start) * 1000
-            records, dnssec_status = _diagnose_servfail(name, record_type, resolver, exc)
+            records, dnssec_status = _diagnose_servfail(
+                name, record_type, resolver, exc
+            )
             return DNSLookupResult(
                 query_name=name,
                 query_type=record_type,
@@ -142,7 +159,9 @@ def register_dns_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(tags={"dns", "dnssec"})
     def dns_trace(
-        name: Annotated[str, Field(description="Domain name to trace (e.g. 'example.com')")],
+        name: Annotated[
+            str, Field(description="Domain name to trace (e.g. 'example.com')")
+        ],
     ) -> DNSTraceResult:
         """Trace DNS resolution from root to authoritative nameservers.
 
@@ -195,9 +214,7 @@ def register_dns_tools(mcp: FastMCP) -> None:
 
 def _dnssec_from_response(response: dns.message.Message) -> DNSSECStatus:
     """Derive DNSSEC status from a resolver response (no extra query)."""
-    has_rrsig = any(
-        rrset.rdtype == dns.rdatatype.RRSIG for rrset in response.answer
-    )
+    has_rrsig = any(rrset.rdtype == dns.rdatatype.RRSIG for rrset in response.answer)
     if not has_rrsig:
         return DNSSECStatus(
             enabled=False,
@@ -260,8 +277,8 @@ def _diagnose_servfail(
                         "validation failure."
                     ),
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("CD-bit re-query of %s/%s failed: %s", name, record_type, exc)
 
     return [], DNSSECStatus(
         enabled=False,
@@ -288,7 +305,11 @@ def _probe_zone(zone: str) -> tuple[DelegationStep, bool]:
         try:
             ns_answer = res.resolve(zone, "NS")
             nameservers = sorted(str(ns) for ns in ns_answer)
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+        except (
+            dns.resolver.NoAnswer,
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers,
+        ):
             nameservers = []
 
         is_zone = zone == "." or bool(nameservers)
@@ -298,7 +319,11 @@ def _probe_zone(zone: str) -> tuple[DelegationStep, bool]:
         try:
             res.resolve(zone, "DNSKEY")
             dnssec_signed = True
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+        except (
+            dns.resolver.NoAnswer,
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers,
+        ):
             pass
 
         # Check for DS records (indicates parent has delegation signer)
@@ -307,7 +332,11 @@ def _probe_zone(zone: str) -> tuple[DelegationStep, bool]:
             try:
                 res.resolve(zone, "DS")
                 ds_present = True
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+            except (
+                dns.resolver.NoAnswer,
+                dns.resolver.NXDOMAIN,
+                dns.resolver.NoNameservers,
+            ):
                 pass
 
         detail = f"{'Signed' if dnssec_signed else 'Unsigned'}"
@@ -325,6 +354,7 @@ def _probe_zone(zone: str) -> tuple[DelegationStep, bool]:
             is_zone,
         )
     except Exception as e:
+        logger.warning("Zone probe failed for %s: %s", zone, e)
         return (
             DelegationStep(
                 zone=zone.rstrip(".") or ".",

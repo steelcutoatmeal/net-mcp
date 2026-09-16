@@ -43,8 +43,14 @@ def test_ripestat_route_lookup_collector_filter(monkeypatch):
     fake = {
         "data": {
             "rrcs": [
-                {"rrc": "RRC00", "peers": [{"as_path": "1 13335", "prefix": "1.1.1.0/24"}]},
-                {"rrc": "RRC06", "peers": [{"as_path": "2 13335", "prefix": "1.1.1.0/24"}]},
+                {
+                    "rrc": "RRC00",
+                    "peers": [{"as_path": "1 13335", "prefix": "1.1.1.0/24"}],
+                },
+                {
+                    "rrc": "RRC06",
+                    "peers": [{"as_path": "2 13335", "prefix": "1.1.1.0/24"}],
+                },
             ]
         }
     }
@@ -55,14 +61,74 @@ def test_ripestat_route_lookup_collector_filter(monkeypatch):
     assert result.routes[0].peer_asn == 2
 
 
-def test_ripestat_route_lookup_error_marks_source(monkeypatch):
+def test_ripestat_route_lookup_failure_sets_error(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(bgp, "ripestat_get", boom)
     result = bgp._ripestat_route_lookup("1.1.1.0/24")
     assert result.routes == []
-    assert result.source.startswith("RIPEstat error")
+    assert result.source == "RIPEstat Looking Glass"
+    assert result.error and "network down" in result.error
+
+
+async def test_route_lookup_falls_back_to_bgptools_only_on_ripestat_error(monkeypatch):
+    """An empty-but-successful RIPEstat answer must NOT trigger the full-table download."""
+    from net_mcp.models import BGPRouteLookupResult
+
+    calls = []
+
+    def fake_bgptools(prefix):
+        calls.append(prefix)
+        return BGPRouteLookupResult(
+            prefix=prefix, routes=[], total=0, source="bgp.tools table"
+        )
+
+    empty_ok = BGPRouteLookupResult(
+        prefix="p", routes=[], total=0, source="RIPEstat Looking Glass"
+    )
+    failed = BGPRouteLookupResult(
+        prefix="p", routes=[], total=0, source="RIPEstat Looking Glass", error="down"
+    )
+
+    monkeypatch.setattr(bgp, "_cloudflare_route_lookup", lambda prefix: None)
+    monkeypatch.setattr(bgp, "_get_bgproutes_key", lambda: None)
+    monkeypatch.setattr(bgp, "_bgptools_route_lookup", fake_bgptools)
+
+    monkeypatch.setattr(
+        bgp, "_ripestat_route_lookup", lambda prefix, collector=None: empty_ok
+    )
+    res = await mcp.call_tool("bgp_route_lookup", {"prefix": "10.0.0.0/8"})
+    assert res.structured_content["source"] == "RIPEstat Looking Glass"
+    assert calls == []
+
+    monkeypatch.setattr(
+        bgp, "_ripestat_route_lookup", lambda prefix, collector=None: failed
+    )
+    res = await mcp.call_tool("bgp_route_lookup", {"prefix": "10.0.0.0/8"})
+    assert res.structured_content["source"] == "bgp.tools table"
+    assert calls == ["10.0.0.0/8"]
+
+
+async def test_prefix_origin_reports_error_when_all_sources_fail(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("ripestat down")
+
+    monkeypatch.setattr(bgp, "cloudflare_get", lambda *a, **k: None)
+    monkeypatch.setattr(bgp, "ripestat_get", boom)
+    res = await mcp.call_tool("bgp_prefix_origin", {"prefix": "1.1.1.0/24"})
+    data = res.structured_content
+    assert data["origins"] == []
+    assert data["error"] and "ripestat down" in data["error"]
+
+
+def test_parse_as_path_and_communities():
+    assert bgp._parse_as_path("13335 174 3356") == [13335, 174, 3356]
+    assert bgp._parse_as_path([1, "2", "{3}"]) == [1, 2]
+    assert bgp._parse_as_path(None) == []
+    assert bgp._parse_communities("174:21100, 174:22013") == ["174:21100", "174:22013"]
+    assert bgp._parse_communities([1, "2:3"]) == ["1", "2:3"]
+    assert bgp._parse_communities("") == []
 
 
 def test_enforce_cache_limit_never_evicts_kept_file(tmp_path):
@@ -77,7 +143,7 @@ def test_enforce_cache_limit_never_evicts_kept_file(tmp_path):
 
     keep = files[-1]
     # Tiny limit forces eviction of everything except the protected file.
-    bgp._enforce_cache_limit(tmp_path, max_gb=1 / (1024 ** 3), keep=keep)
+    bgp._enforce_cache_limit(tmp_path, max_gb=1 / (1024**3), keep=keep)
 
     assert keep.exists()
     assert not files[0].exists()
@@ -89,19 +155,10 @@ def test_asn_cache_not_poisoned_on_failure(monkeypatch):
     monkeypatch.setattr(bgp, "_bgptools_asn_cache", None)
 
     class FakeClient:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
         def get(self, *a, **k):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(bgp.httpx, "Client", FakeClient)
+    monkeypatch.setattr(bgp, "get_http_client", lambda: FakeClient())
     assert bgp._bgptools_load_asn_cache() == {}
     assert bgp._bgptools_asn_cache is None  # not poisoned
 
@@ -126,7 +183,7 @@ async def test_bgp_asn_info_caps_prefix_lists(monkeypatch):
     v4 = [f"10.{i}.0.0/24" for i in range(150)]
     v6 = [f"2001:db8:{i:x}::/48" for i in range(150)]
     monkeypatch.setattr(bgp, "_get_as_name", lambda asn: "TESTAS")
-    monkeypatch.setattr(bgp, "_get_announced_prefixes", lambda asn: (v4, v6))
+    monkeypatch.setattr(bgp, "_get_announced_prefixes", lambda asn: (v4, v6, None))
     monkeypatch.setattr(bgp, "_get_upstreams", lambda asn: [1, 2])
 
     res = await mcp.call_tool("bgp_asn_info", {"asn": 64500})
@@ -139,7 +196,9 @@ async def test_bgp_asn_info_caps_prefix_lists(monkeypatch):
 
 async def test_bgp_asn_info_small_as_not_truncated(monkeypatch):
     monkeypatch.setattr(bgp, "_get_as_name", lambda asn: "SMALLAS")
-    monkeypatch.setattr(bgp, "_get_announced_prefixes", lambda asn: (["1.1.1.0/24"], []))
+    monkeypatch.setattr(
+        bgp, "_get_announced_prefixes", lambda asn: (["1.1.1.0/24"], [], None)
+    )
     monkeypatch.setattr(bgp, "_get_upstreams", lambda asn: [])
 
     res = await mcp.call_tool("bgp_asn_info", {"asn": 64501})

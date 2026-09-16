@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "net-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PROJECT_DIR}", "net-mcp"],
+      "env": {
+        "CLOUDFLARE_API_TOKEN": "${CLOUDFLARE_API_TOKEN:-}",
+        "BGPROUTES_API_KEY": "${BGPROUTES_API_KEY:-}"
+      }
+    }
+  }
+}
